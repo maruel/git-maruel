@@ -90,7 +90,7 @@ def rebase_branch(branch: str, parent: str, start_hash: str) -> bool:
     if run_git_command(["git", "rebase", parent], check=False)[1] == 0:
         return True
     # Rebase failed - try to resolve with mergetool
-    print(f"  Conflicts detected. Starting mergetool...")
+    print("  Conflicts detected. Starting mergetool...")
     while True:
         ret = subprocess.run(["git", "mergetool"], check=False)
         if ret.returncode:

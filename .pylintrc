@@ -1,0 +1,7 @@
+[MASTER]
+disable=
+    invalid-name,
+    too-many-locals,
+    too-many-branches,
+    too-many-return-statements,
+    duplicate-code,
