@@ -114,6 +114,15 @@ def remove_empty_branches(sorted_branches: typing.List[typing.Tuple[str, str]]) 
                             f"- {format_branch_name(other_branch)}: "
                             f"Reparented to {format_branch_name(parent)}"
                         )
+                # Check if we're currently on the branch to be deleted
+                current_branch, _ = run_git_command(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False
+                )
+                if current_branch == branch:
+                    # Switch to a fallback branch before deleting
+                    for fallback in ["main", "master", "origin/main", "origin/master"]:
+                        if run_git_command(["git", "checkout", fallback], check=False)[1] == 0:
+                            break
                 run_git_command(["git", "branch", "-d", branch])
                 print(f"- {format_branch_name(branch)}: deleted")
 
