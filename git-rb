@@ -99,11 +99,14 @@ def rebase_branch(branch: str, parent: str, start_hash: str) -> bool:
             return True
 
 
-def remove_empty_branches(sorted_branches: typing.List[typing.Tuple[str, str]]) -> None:
-    """Remove empty branches in reverse topological order."""
+def remove_empty_branches(
+    sorted_branches: typing.List[typing.Tuple[str, str]],
+) -> typing.Set[str]:
+    """Remove empty branches in reverse topological order. Returns set of deleted branches."""
+    deleted = set()
     # Reverse to process children before parents
     for branch, parent in reversed(sorted_branches):
-        if branch not in ("master", "main"):
+        if branch not in ("main", "master"):
             branch_tree = get_tree(branch)
             if bool(branch_tree) and branch_tree == get_tree(parent):
                 # Reparent any branches that depend on this branch
@@ -120,11 +123,18 @@ def remove_empty_branches(sorted_branches: typing.List[typing.Tuple[str, str]]) 
                 )
                 if current_branch == branch:
                     # Switch to a fallback branch before deleting
-                    for fallback in ["main", "master", "origin/main", "origin/master"]:
-                        if run_git_command(["git", "checkout", fallback], check=False)[1] == 0:
+                    for fallback in ("main", "master", "origin/main", "origin/master"):
+                        if (
+                            run_git_command(["git", "checkout", fallback], check=False)[
+                                1
+                            ]
+                            == 0
+                        ):
                             break
                 run_git_command(["git", "branch", "-d", branch])
                 print(f"- {format_branch_name(branch)}: deleted")
+                deleted.add(branch)
+    return deleted
 
 
 def main() -> int:
@@ -177,12 +187,18 @@ def main() -> int:
             print("The following branches could not be cleanly rebased:")
             for branch in unrebased_branches:
                 print(f"  {format_branch_name(branch)}")
+        deleted_branches = set()
         if retcode == 0:
-            remove_empty_branches(sorted_branches)
+            deleted_branches = remove_empty_branches(sorted_branches)
             run_git_command(["git", "gc", "--auto"])
         # Restore the original branch/commit
-        if original_ref:
+        if original_ref not in deleted_branches:
             run_git_command(["git", "checkout", original_ref], check=False)
+        else:
+            # Original branch was deleted, fall back to safe branches
+            for fallback in ("main", "master", "origin/main", "origin/master"):
+                if run_git_command(["git", "checkout", fallback], check=False)[1] == 0:
+                    break
         return retcode
     except subprocess.CalledProcessError as e:
         # Find the frame that called run_git_command
