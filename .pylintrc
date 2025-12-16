@@ -1,7 +1,8 @@
 [MASTER]
 disable=
-    invalid-name,
-    too-many-locals,
-    too-many-branches,
-    too-many-return-statements,
+		too-many-nested-blocks,
     duplicate-code,
+    invalid-name,
+    too-many-branches,
+    too-many-locals,
+    too-many-return-statements,
