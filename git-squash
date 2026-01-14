@@ -61,7 +61,19 @@ def main() -> int:
         commits_count, _ = run_git_command(
             ["git", "rev-list", "--count", f"{ancestor}..HEAD"]
         )
-        if commits_count in ("0", "1"):
+        if commits_count == "0":
+            return 0
+        if commits_count == "1":
+            ident, rc = run_git_command(["git", "var", "GIT_AUTHOR_IDENT"], check=False)
+            if rc == 0:
+                expected_author = ident.rsplit(" ", 2)[0]
+                actual_author, _ = run_git_command(
+                    ["git", "log", "-1", "--pretty=format:%an <%ae>", "HEAD"]
+                )
+                if expected_author != actual_author:
+                    run_git_command(
+                        ["git", "commit", "--amend", "--no-edit", "--reset-author"]
+                    )
             return 0
         old_log, _ = run_git_command(
             ["git", "log", "--pretty=format:%B%x00", f"{ancestor}..HEAD"]
