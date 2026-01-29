@@ -1,0 +1,32 @@
+#!/bin/bash
+# git-mt: Auto-resolve merge=ours files, then run mergetool
+# Automatically continues rebase when no manual merge is needed.
+
+set -eu -o pipefail
+
+git_dir="$(git rev-parse --git-dir)"
+
+while true; do
+	# Auto-resolve merge=ours files
+	git diff --name-only --diff-filter=U | while read -r file; do
+		if git check-attr merge -- "$file" | grep -q "merge: ours"; then
+			echo "Auto-resolving: $file"
+			git checkout --ours -- "$file" 2>/dev/null || echo "  (skip - not in ours)"
+			git add -- "$file" 2>/dev/null || true
+		fi
+	done || true # Don't fail if no unmerged files
+
+	# If conflicts remain, open mergetool
+	if git diff --name-only --diff-filter=U | grep -q .; then
+		exec git mergetool "$@"
+	fi
+
+	# No conflicts remain. If in a rebase, continue automatically.
+	if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+		echo "No files need merging. Continuing rebase..."
+		git rebase --continue || true # Will stop at next conflict or complete
+	else
+		echo "No files need merging."
+		exit 0
+	fi
+done
