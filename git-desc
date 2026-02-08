@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""git desc: Generate a commit description using an LLM.
+
+Gathers the diff between the current branch and its upstream merge-base,
+along with context (branch name, changed files, recent upstream commits),
+and sends it to the 'ask' tool to generate a commit message.
+
+Designed to work with the squash workflow: after 'git squash', run 'git desc'
+to generate a meaningful commit message, then 'git commit --amend -F -'.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import traceback
+import typing
+
+_PROMPT = (
+    "Write a git commit message for the changes below. Follow these rules:\n"
+    "- Subject: imperative mood, no period, max 72 chars "
+    '(e.g. "Fix timeout in retry loop")\n'
+    "- If the change is non-trivial, add a blank line then a body "
+    "explaining what and why, not how\n"
+    "- Wrap body lines at 72 chars\n"
+    "- Match the style of recent upstream commits if provided\n"
+    "- Focus on the meaningful changes; ignore ancillary updates "
+    "(imports, test data, build files, dependency bumps, formatting) "
+    "unless they are the primary purpose of the commit\n"
+    "- No emojis\n"
+    "- Output only the commit message, nothing else"
+)
+
+
+def run_git_command(
+    cmd: typing.List[str], check: bool = True
+) -> typing.Tuple[str, int]:
+    """Run a git command and return output and return code."""
+    result = subprocess.run(cmd, capture_output=True, text=True, check=check)
+    return result.stdout.strip(), result.returncode
+
+
+def get_ancestor(base: typing.Optional[str]) -> typing.Optional[str]:
+    """Get the ancestor (merge-base) between HEAD and base ref or upstream."""
+    if base:
+        # Verify the ref exists.
+        _, rc = run_git_command(["git", "rev-parse", "--verify", base], check=False)
+        if rc != 0:
+            print(f"Invalid ref: {base}", file=sys.stderr)
+            return None
+        ancestor, rc = run_git_command(
+            ["git", "merge-base", "HEAD", base], check=False
+        )
+        return None if rc != 0 else ancestor
+    _, rc = run_git_command(["git", "rev-parse", "--abbrev-ref", "@{u}"], check=False)
+    if rc != 0:
+        return None
+    ancestor, rc = run_git_command(["git", "merge-base", "HEAD", "@{u}"], check=False)
+    return None if rc != 0 else ancestor
+
+
+def _extract_path(diff_line: str) -> str:
+    """Extract the file path from a 'diff --git' line.
+
+    Handles both prefixed ("diff --git a/foo b/foo") and noprefix
+    ("diff --git foo foo") formats.
+    """
+    # Try standard a/ b/ prefix first.
+    parts = diff_line.split(" b/", 1)
+    if len(parts) == 2:
+        return parts[1].rstrip()
+    # Noprefix: "diff --git foo bar" — take the last space-separated token.
+    tokens = diff_line.rstrip().split()
+    return tokens[-1] if len(tokens) >= 4 else ""
+
+
+def filter_diff(diff: str, excludes: typing.List[str]) -> str:
+    """Filter a unified diff, dropping hunks for files matching excludes."""
+    if not excludes:
+        return diff
+    chunks: typing.List[str] = []
+    current: typing.List[str] = []
+    skip = False
+    for line in diff.splitlines(True):
+        if line.startswith("diff --git "):
+            if current and not skip:
+                chunks.append("".join(current))
+            current = [line]
+            path = _extract_path(line)
+            skip = any(path.startswith(e) for e in excludes)
+        else:
+            current.append(line)
+    if current and not skip:
+        chunks.append("".join(current))
+    return "".join(chunks)
+
+
+def gather_context(
+    ancestor: str, excludes: typing.List[str], diff_context: int
+) -> str:
+    """Gather git context for the LLM prompt."""
+    parts: typing.List[str] = []
+    pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
+
+    branch, _ = run_git_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    parts.append(f"=== Branch ===\n{branch}\n")
+
+    stat, _ = run_git_command(
+        ["git", "diff", "--stat", f"{ancestor}..HEAD"] + pathspecs
+    )
+    parts.append(f"=== Files Changed ===\n{stat}\n")
+
+    log, _ = run_git_command(
+        ["git", "log", "-5", "--oneline", f"{ancestor}..HEAD"]
+    )
+    if log:
+        parts.append(f"=== Commits ===\n{log}\n")
+
+    upstream_log, _ = run_git_command(
+        ["git", "log", "-5", "--oneline", ancestor]
+    )
+    parts.append(f"=== Recent Upstream Commits ===\n{upstream_log}\n")
+
+    diff, _ = run_git_command(
+        [
+            "git", "-c", "diff.noprefix=false",
+            "diff", "--patience", f"-U{diff_context}", f"{ancestor}..HEAD",
+        ]
+        + pathspecs
+    )
+    parts.append(f"=== Changes ===\n{diff}")
+
+    return "\n".join(parts)
+
+
+def context_from_stdin(
+    raw: str, excludes: typing.List[str]
+) -> str:
+    """Build LLM context from a diff provided on stdin."""
+    filtered = filter_diff(raw, excludes)
+    return f"=== Changes ===\n{filtered}"
+
+
+def main() -> int:
+    """Main entry point."""
+    try:
+        parser = argparse.ArgumentParser(
+            description="Generate a commit description using an LLM."
+        )
+        parser.add_argument(
+            "-b",
+            "--base",
+            help="base ref to diff against (default: upstream merge-base)",
+        )
+        parser.add_argument(
+            "-c",
+            "--context",
+            type=int,
+            default=10,
+            help="lines of diff context (default: 10)",
+        )
+        parser.add_argument(
+            "-e",
+            "--exclude",
+            action="append",
+            default=[],
+            help="path prefix to exclude from diff (can be repeated)",
+        )
+        parser.add_argument(
+            "--stdin",
+            action="store_true",
+            help="read diff from stdin instead of computing from git",
+        )
+        args = parser.parse_args()
+        if args.stdin and args.base:
+            parser.error("--stdin and --base are mutually exclusive")
+
+        if not shutil.which("ask"):
+            print("'ask' tool not found in PATH", file=sys.stderr)
+            print(
+                "Install it with: go install github.com/maruel/ask@latest",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.stdin:
+            raw = sys.stdin.read()
+            if not raw.strip():
+                print("Empty input on stdin", file=sys.stderr)
+                return 1
+            context = context_from_stdin(raw, args.exclude)
+        else:
+            output, rc = run_git_command(
+                ["git", "rev-parse", "--show-toplevel"], check=False
+            )
+            if rc != 0:
+                print("Not in a git repository", file=sys.stderr)
+                return 1
+            os.chdir(output)
+            branch, rc = run_git_command(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False
+            )
+            if rc != 0 or branch == "HEAD":
+                print("Not on a branch (detached HEAD state)", file=sys.stderr)
+                return 1
+            ancestor = get_ancestor(args.base)
+            if not ancestor:
+                if args.base:
+                    return 1
+                print(
+                    f"No upstream branch configured for '{branch}'.\n"
+                    "Set an upstream with: "
+                    "git branch --set-upstream-to=<upstream>",
+                    file=sys.stderr,
+                )
+                return 1
+            commits_count, _ = run_git_command(
+                ["git", "rev-list", "--count", f"{ancestor}..HEAD"]
+            )
+            if commits_count == "0":
+                print("No commits to describe", file=sys.stderr)
+                return 1
+            context = gather_context(ancestor, args.exclude, args.context)
+        result = subprocess.run(
+            ["ask", "-q", _PROMPT],
+            input=context,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            print("Failed to generate commit description", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+            return 1
+        print(result.stdout.strip())
+        return 0
+    except subprocess.TimeoutExpired:
+        print("Timed out waiting for LLM response", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as e:
+        tb = traceback.extract_tb(e.__traceback__)
+        frame = None
+        for i, f in enumerate(tb):
+            if f.name == "run_git_command" and i > 0:
+                frame = tb[i - 1]
+                break
+        if frame:
+            print(f"Error in {frame.name}() at line {frame.lineno}:", file=sys.stderr)
+        print(f"Command failed: {' '.join(e.cmd)}", file=sys.stderr)
+        if e.stdout:
+            print(f"stdout: {e.stdout}", file=sys.stderr)
+        if e.stderr:
+            print(f"stderr: {e.stderr}", file=sys.stderr)
+        return e.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

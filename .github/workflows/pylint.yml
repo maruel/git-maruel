@@ -11,4 +11,4 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install pylint
-      - run: pylint git-rb git-squash
+      - run: pylint git-desc git-rb git-squash
