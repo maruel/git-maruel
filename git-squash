@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """git squash: Squash all commits on the current branch into a single commit"""
 
+import argparse
 import os
 import subprocess
 import sys
 import traceback
 import typing
+
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def run_git_command(
@@ -25,12 +29,36 @@ def get_ancestor() -> typing.Optional[str]:
     return None if rc != 0 else ancestor
 
 
+def generate_desc() -> int:
+    """Run git-desc and amend the current commit with the generated message."""
+    desc_path = os.path.join(_BASE_DIR, "git-desc")
+    result = subprocess.run(
+        [desc_path], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        print("Failed to generate commit description", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        return 1
+    msg = result.stdout.strip()
+    run_git_command(["git", "commit", "--amend", "-m", msg])
+    return 0
+
+
 def main() -> int:
     """Main entry point."""
     try:
-        if len(sys.argv) > 1:
-            print(f"Unexpected argument: {sys.argv[1]}", file=sys.stderr)
-            return 1
+        parser = argparse.ArgumentParser(
+            description="Squash all commits on the current branch into one."
+        )
+        parser.add_argument(
+            "-d",
+            "--desc",
+            action="store_true",
+            help="generate commit message with git-desc after squashing",
+        )
+        args = parser.parse_args()
+
         output, rc = run_git_command(
             ["git", "rev-parse", "--show-toplevel"], check=False
         )
@@ -74,6 +102,8 @@ def main() -> int:
                     run_git_command(
                         ["git", "commit", "--amend", "--no-edit", "--reset-author"]
                     )
+            if args.desc:
+                return generate_desc()
             return 0
         old_log, _ = run_git_command(
             ["git", "log", "--pretty=format:%B%x00", f"{ancestor}..HEAD"]
@@ -87,6 +117,8 @@ def main() -> int:
         # print(f"Squashing {commits_count} commits on branch '{branch}'...")
         run_git_command(["git", "reset", "--soft", ancestor])
         run_git_command(["git", "commit", "-m", new_log])
+        if args.desc:
+            return generate_desc()
         return 0
     except subprocess.CalledProcessError as e:
         # Find the frame that called run_git_command
