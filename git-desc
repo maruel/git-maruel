@@ -19,34 +19,70 @@ import sys
 import traceback
 import typing
 
-_PROMPT = (
-    "Write a git commit message for the changes below. Follow these rules:\n"
-    "- Subject: imperative mood, no period, max 72 chars "
-    '(e.g. "Fix timeout in retry loop")\n'
-    "- If the change is non-trivial, add a blank line then a body "
-    "explaining what and why, not how\n"
-    "- Wrap body lines at 72 chars\n"
-    "- Match the style of recent upstream commits if provided\n"
-    "- Focus on the meaningful changes; ignore ancillary updates "
-    "(imports, test data, build files, dependency bumps, formatting) "
-    "unless they are the primary purpose of the commit\n"
-    "- No emojis\n"
-    "- Output only the commit message, nothing else"
+
+class _Prompts(typing.NamedTuple):
+    main: str
+    chunk: str
+    summary: str
+
+
+_COMMIT_PROMPTS = _Prompts(
+    main=(
+        "Write a git commit message for the changes below. Follow these rules:\n"
+        "- Subject: imperative mood, no period, max 72 chars "
+        '(e.g. "Fix timeout in retry loop")\n'
+        "- If the change is non-trivial, add a blank line then a body "
+        "explaining what and why, not how\n"
+        "- Wrap body lines at 72 chars\n"
+        "- Match the style of recent upstream commits if provided\n"
+        "- Focus on the meaningful changes; ignore ancillary updates "
+        "(imports, test data, build files, dependency bumps, formatting) "
+        "unless they are the primary purpose of the commit\n"
+        "- No emojis\n"
+        "- Output only the commit message, nothing else"
+    ),
+    chunk=(
+        "Summarize the following code changes in a few paragraphs. "
+        "Focus on what changed and why. Output a brief description."
+    ),
+    summary=(
+        "Below are descriptions of different parts of the same commit. "
+        "Write a single unified git commit message following these rules:\n"
+        "- Subject: imperative mood, no period, max 72 chars\n"
+        "- If non-trivial, add a blank line then a body explaining what and why\n"
+        "- Wrap body lines at 72 chars\n"
+        "- No emojis\n"
+        "- Output only the commit message, nothing else"
+    ),
 )
 
-_CHUNK_PROMPT = (
-    "Summarize the following code changes in a few paragraphs. "
-    "Focus on what changed and why. Output a brief description."
-)
-
-_SUMMARY_PROMPT = (
-    "Below are descriptions of different parts of the same commit. "
-    "Write a single unified git commit message following these rules:\n"
-    "- Subject: imperative mood, no period, max 72 chars\n"
-    "- If non-trivial, add a blank line then a body explaining what and why\n"
-    "- Wrap body lines at 72 chars\n"
-    "- No emojis\n"
-    "- Output only the commit message, nothing else"
+_RELEASE_PROMPTS = _Prompts(
+    main=(
+        "Write release notes for the changes below in Markdown. Follow these rules:\n"
+        "- Categorize changes under headings: Features, Bug Fixes, Breaking Changes, "
+        "Other (omit empty categories)\n"
+        "- Each item is a concise bullet point describing the user-facing change\n"
+        "- Derive information primarily from the commit messages, "
+        "using the diff for additional detail\n"
+        "- Ignore internal refactors, test-only changes, and dependency bumps "
+        "unless they affect users\n"
+        "- No emojis\n"
+        "- Output only the release notes, nothing else"
+    ),
+    chunk=(
+        "Summarize the following code changes for release notes. "
+        "Focus on user-facing features, bug fixes, and breaking changes. "
+        "Output a brief description."
+    ),
+    summary=(
+        "Below are summaries of different parts of the same release. "
+        "Write unified release notes in Markdown following these rules:\n"
+        "- Categorize under headings: Features, Bug Fixes, Breaking Changes, "
+        "Other (omit empty categories)\n"
+        "- Each item is a concise bullet point describing the user-facing change\n"
+        "- No emojis\n"
+        "- Output only the release notes, nothing else"
+    ),
 )
 
 _MAX_CONTEXT = 200_000
@@ -254,6 +290,37 @@ def _gather_metadata(ancestor: str, excludes: typing.List[str]) -> str:
     return "\n".join(parts)
 
 
+def _gather_release_metadata(ancestor: str, excludes: typing.List[str]) -> str:
+    """Gather metadata for release notes, including all commit messages."""
+    parts: typing.List[str] = []
+    pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
+
+    stat, _ = run_git_command(
+        ["git", "diff", "--stat", f"{ancestor}..HEAD"] + pathspecs
+    )
+    parts.append(f"=== Files Changed ===\n{stat}\n")
+
+    log, _ = run_git_command(
+        ["git", "log", "--reverse", "--format=%h %s", f"{ancestor}..HEAD"]
+    )
+    if log:
+        parts.append(f"=== Commits ===\n{log}\n")
+
+    full_log, _ = run_git_command(
+        [
+            "git",
+            "log",
+            "--reverse",
+            "--format=--- %h %s ---%n%b",
+            f"{ancestor}..HEAD",
+        ]
+    )
+    if full_log:
+        parts.append(f"=== Full Commit Messages ===\n{full_log}\n")
+
+    return "\n".join(parts)
+
+
 def _get_diff(ancestor: str, excludes: typing.List[str], diff_context: int) -> str:
     """Get the diff between ancestor and HEAD."""
     pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
@@ -328,7 +395,7 @@ def _call_ask(prompt: str, context: str, timeout: int = 30) -> typing.Optional[s
     return result.stdout.strip()
 
 
-def _parallel_describe(metadata: str, diff: str) -> int:
+def _parallel_describe(metadata: str, diff: str, prompts: _Prompts) -> int:
     """Split diff into chunks, describe each in parallel, then summarize."""
     overhead = len(metadata) + 200
     max_chunk = max(_MAX_CONTEXT - overhead, _MAX_CONTEXT // 2)
@@ -344,7 +411,7 @@ def _parallel_describe(metadata: str, diff: str) -> int:
         futures = {}
         for i, chunk in enumerate(chunks):
             ctx = _build_context(metadata, f"(part {i + 1}/{len(chunks)})\n{chunk}")
-            futures[pool.submit(_call_ask, _CHUNK_PROMPT, ctx, 60)] = i
+            futures[pool.submit(_call_ask, prompts.chunk, ctx, 60)] = i
 
         for future in concurrent.futures.as_completed(futures):
             idx = futures[future]
@@ -361,9 +428,9 @@ def _parallel_describe(metadata: str, diff: str) -> int:
 
     descriptions.sort()
     summaries = "\n\n".join(f"Part {idx + 1}:\n{desc}" for idx, desc in descriptions)
-    final = _call_ask(_SUMMARY_PROMPT, summaries)
+    final = _call_ask(prompts.summary, summaries)
     if not final:
-        print("Failed to generate final commit description", file=sys.stderr)
+        print("Failed to generate final summary", file=sys.stderr)
         return 1
     print(final)
     return 0
@@ -395,6 +462,12 @@ def main() -> int:
             help="path prefix to exclude from diff (can be repeated)",
         )
         parser.add_argument(
+            "-r",
+            "--release",
+            action="store_true",
+            help="generate release notes instead of a commit message",
+        )
+        parser.add_argument(
             "--stdin",
             action="store_true",
             help="read diff from stdin instead of computing from git",
@@ -402,6 +475,8 @@ def main() -> int:
         args = parser.parse_args()
         if args.stdin and args.base:
             parser.error("--stdin and --base are mutually exclusive")
+        if args.stdin and args.release:
+            parser.error("--stdin and --release are mutually exclusive")
 
         if not shutil.which("ask"):
             print("'ask' tool not found in PATH", file=sys.stderr)
@@ -449,7 +524,10 @@ def main() -> int:
             if commits_count == "0":
                 print("No commits to describe", file=sys.stderr)
                 return 1
-            metadata = _gather_metadata(ancestor, args.exclude)
+            if args.release:
+                metadata = _gather_release_metadata(ancestor, args.exclude)
+            else:
+                metadata = _gather_metadata(ancestor, args.exclude)
             diff = _get_diff(ancestor, args.exclude, args.context)
 
         # Step 1: reduce diff context lines to 3.
@@ -475,12 +553,14 @@ def main() -> int:
 
         context = _build_context(metadata, diff)
 
+        prompts = _RELEASE_PROMPTS if args.release else _COMMIT_PROMPTS
+
         # Step 4: split into chunks and parallelize.
         if len(context) > _MAX_CONTEXT:
-            return _parallel_describe(metadata, diff)
+            return _parallel_describe(metadata, diff, prompts)
 
         result = subprocess.run(
-            ["ask", "-q", _PROMPT],
+            ["ask", "-q", prompts.main],
             input=context,
             capture_output=True,
             text=True,
@@ -488,7 +568,7 @@ def main() -> int:
             check=False,
         )
         if result.returncode != 0 or not result.stdout.strip():
-            print("Failed to generate commit description", file=sys.stderr)
+            print("Failed to generate output", file=sys.stderr)
             if result.stderr:
                 print(result.stderr, file=sys.stderr)
             return 1

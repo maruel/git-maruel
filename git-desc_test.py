@@ -332,5 +332,75 @@ class TestReduceDiffContext(unittest.TestCase):
         self.assertEqual(gd._reduce_diff_context("", 3), "")
 
 
+class TestGatherReleaseMetadata(unittest.TestCase):
+    """Tests for _gather_release_metadata."""
+
+    def test_includes_full_commit_log(self):
+        """Verify _gather_release_metadata requests the full commit log."""
+        calls = []
+        orig = gd.run_git_command
+
+        def fake_run(cmd, check=True):
+            calls.append(cmd)
+            return ("fake output", 0)
+
+        gd.run_git_command = fake_run
+        try:
+            result = gd._gather_release_metadata("abc123", [])
+        finally:
+            gd.run_git_command = orig
+
+        # Should include a git log call without -N limit (full history).
+        log_cmds = [c for c in calls if "log" in c]
+        self.assertTrue(len(log_cmds) >= 2, f"Expected >=2 log commands, got {log_cmds}")
+        # No -N limit on the log commands.
+        for cmd in log_cmds:
+            for arg in cmd:
+                self.assertFalse(
+                    arg.startswith("-") and arg[1:].isdigit(),
+                    f"Unexpected limit arg {arg} in {cmd}",
+                )
+        # Result should contain the full commit messages section.
+        self.assertIn("Full Commit Messages", result)
+
+    def test_excludes_paths(self):
+        """Verify pathspec excludes are passed to diff --stat."""
+        calls = []
+        orig = gd.run_git_command
+
+        def fake_run(cmd, check=True):
+            calls.append(cmd)
+            return ("fake output", 0)
+
+        gd.run_git_command = fake_run
+        try:
+            gd._gather_release_metadata("abc123", ["vendor/"])
+        finally:
+            gd.run_git_command = orig
+
+        stat_cmds = [c for c in calls if "--stat" in c]
+        self.assertEqual(len(stat_cmds), 1)
+        self.assertIn(":(exclude)vendor/", stat_cmds[0])
+
+    def test_no_commits_section_when_empty(self):
+        """Verify empty log produces no Commits section."""
+        orig = gd.run_git_command
+
+        def fake_run(cmd, check=True):
+            if "log" in cmd:
+                return ("", 0)
+            return ("some stat", 0)
+
+        gd.run_git_command = fake_run
+        try:
+            result = gd._gather_release_metadata("abc123", [])
+        finally:
+            gd.run_git_command = orig
+
+        self.assertNotIn("=== Commits ===", result)
+        self.assertNotIn("=== Full Commit Messages ===", result)
+        self.assertIn("=== Files Changed ===", result)
+
+
 if __name__ == "__main__":
     unittest.main()
