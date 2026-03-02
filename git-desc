@@ -85,7 +85,10 @@ _RELEASE_PROMPTS = _Prompts(
     ),
 )
 
-_MAX_CONTEXT = 200_000
+# While many models support 200k tokens, some providers like Groq have models that only support 120k tokens.
+# The number of chacters is in theory larger than this but in practice this is a safe limit since code likely
+# requires more tokens to encode than normal text.
+_MAX_CONTEXT = 100_000
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 
