@@ -35,7 +35,7 @@ _PROMPT = (
 )
 
 _CHUNK_PROMPT = (
-    "Summarize the following code changes concisely. "
+    "Summarize the following code changes in a few paragraphs. "
     "Focus on what changed and why. Output a brief description."
 )
 
@@ -51,9 +51,7 @@ _SUMMARY_PROMPT = (
 
 _MAX_CONTEXT = 200_000
 
-_HUNK_RE = re.compile(
-    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
-)
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 
 
 def run_git_command(
@@ -72,9 +70,7 @@ def get_ancestor(base: typing.Optional[str]) -> typing.Optional[str]:
         if rc != 0:
             print(f"Invalid ref: {base}", file=sys.stderr)
             return None
-        ancestor, rc = run_git_command(
-            ["git", "merge-base", "HEAD", base], check=False
-        )
+        ancestor, rc = run_git_command(["git", "merge-base", "HEAD", base], check=False)
         return None if rc != 0 else ancestor
     _, rc = run_git_command(["git", "rev-parse", "--abbrev-ref", "@{u}"], check=False)
     if rc != 0:
@@ -98,9 +94,7 @@ def _extract_path(diff_line: str) -> str:
     return tokens[-1] if len(tokens) >= 4 else ""
 
 
-def _filter_diff(
-    diff: str, should_exclude: typing.Callable[[str], bool]
-) -> str:
+def _filter_diff(diff: str, should_exclude: typing.Callable[[str], bool]) -> str:
     """Filter a unified diff, dropping hunks for files matching predicate."""
     chunks: typing.List[str] = []
     current: typing.List[str] = []
@@ -218,9 +212,7 @@ def _reduce_diff_context(diff: str, target: int) -> str:
         # Collect hunk body (until next hunk header or file header).
         i += 1
         body: typing.List[str] = []
-        while i < len(lines) and not lines[i].startswith(
-            ("diff --git ", "@@")
-        ):
+        while i < len(lines) and not lines[i].startswith(("diff --git ", "@@")):
             body.append(lines[i])
             i += 1
 
@@ -233,8 +225,7 @@ def _reduce_diff_context(diff: str, target: int) -> str:
         old_count = sum(1 for l in trimmed if l[:1] in (" ", "-"))
         new_count = sum(1 for l in trimmed if l[:1] in (" ", "+"))
         result.append(
-            f"@@ -{old_start},{old_count} +{new_start},{new_count}"
-            f" @@{func_ctx}\n"
+            f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{func_ctx}\n"
         )
         result.extend(trimmed)
     return "".join(result)
@@ -253,29 +244,28 @@ def _gather_metadata(ancestor: str, excludes: typing.List[str]) -> str:
     )
     parts.append(f"=== Files Changed ===\n{stat}\n")
 
-    log, _ = run_git_command(
-        ["git", "log", "-5", "--oneline", f"{ancestor}..HEAD"]
-    )
+    log, _ = run_git_command(["git", "log", "-5", "--oneline", f"{ancestor}..HEAD"])
     if log:
         parts.append(f"=== Commits ===\n{log}\n")
 
-    upstream_log, _ = run_git_command(
-        ["git", "log", "-5", "--oneline", ancestor]
-    )
+    upstream_log, _ = run_git_command(["git", "log", "-5", "--oneline", ancestor])
     parts.append(f"=== Recent Upstream Commits ===\n{upstream_log}\n")
 
     return "\n".join(parts)
 
 
-def _get_diff(
-    ancestor: str, excludes: typing.List[str], diff_context: int
-) -> str:
+def _get_diff(ancestor: str, excludes: typing.List[str], diff_context: int) -> str:
     """Get the diff between ancestor and HEAD."""
     pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
     diff, _ = run_git_command(
         [
-            "git", "-c", "diff.noprefix=false",
-            "diff", "--patience", f"-U{diff_context}", f"{ancestor}..HEAD",
+            "git",
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--patience",
+            f"-U{diff_context}",
+            f"{ancestor}..HEAD",
         ]
         + pathspecs
     )
@@ -320,9 +310,7 @@ def _split_diff(diff: str, max_chunk: int) -> typing.List[str]:
     return chunks if chunks else [diff]
 
 
-def _call_ask(
-    prompt: str, context: str, timeout: int = 30
-) -> typing.Optional[str]:
+def _call_ask(prompt: str, context: str, timeout: int = 30) -> typing.Optional[str]:
     """Call the ask tool and return its output, or None on failure."""
     try:
         result = subprocess.run(
@@ -352,14 +340,10 @@ def _parallel_describe(metadata: str, diff: str) -> int:
     )
 
     descriptions: typing.List[typing.Tuple[int, str]] = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(len(chunks), 4)
-    ) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as pool:
         futures = {}
         for i, chunk in enumerate(chunks):
-            ctx = _build_context(
-                metadata, f"(part {i + 1}/{len(chunks)})\n{chunk}"
-            )
+            ctx = _build_context(metadata, f"(part {i + 1}/{len(chunks)})\n{chunk}")
             futures[pool.submit(_call_ask, _CHUNK_PROMPT, ctx, 60)] = i
 
         for future in concurrent.futures.as_completed(futures):
@@ -372,15 +356,11 @@ def _parallel_describe(metadata: str, diff: str) -> int:
                 pass
 
     if not descriptions:
-        print(
-            "Failed to generate descriptions for any chunk", file=sys.stderr
-        )
+        print("Failed to generate descriptions for any chunk", file=sys.stderr)
         return 1
 
     descriptions.sort()
-    summaries = "\n\n".join(
-        f"Part {idx + 1}:\n{desc}" for idx, desc in descriptions
-    )
+    summaries = "\n\n".join(f"Part {idx + 1}:\n{desc}" for idx, desc in descriptions)
     final = _call_ask(_SUMMARY_PROMPT, summaries)
     if not final:
         print("Failed to generate final commit description", file=sys.stderr)
