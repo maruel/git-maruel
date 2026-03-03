@@ -166,7 +166,13 @@ def _is_test_file(path: str) -> bool:
 
 def _is_data_file(path: str) -> bool:
     """Check if a path is a JSON or YAML file."""
-    return os.path.splitext(path)[1].lower() in (".json", ".yaml", ".yml")
+    return os.path.splitext(path)[1].lower() in (
+        ".json",
+        ".jsonl",
+        ".ndjson",
+        ".yaml",
+        ".yml",
+    )
 
 
 def _trim_hunk_context(
