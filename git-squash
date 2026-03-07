@@ -115,8 +115,12 @@ def main() -> int:
             if msg and not all(c in ".,\n\r\t " for c in msg)
         ) or "Squashed commits"
         # print(f"Squashing {commits_count} commits on branch '{branch}'...")
+        original_head, _ = run_git_command(["git", "rev-parse", "HEAD"])
         run_git_command(["git", "reset", "--soft", ancestor])
-        run_git_command(["git", "commit", "-m", new_log])
+        result = subprocess.run(["git", "commit", "-m", new_log], check=False)
+        if result.returncode != 0:
+            run_git_command(["git", "reset", "--hard", original_head])
+            return result.returncode
         if args.desc:
             return generate_desc()
         return 0
