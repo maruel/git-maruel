@@ -164,7 +164,22 @@ def main() -> int:
         if not branch_tree:
             print("No branches with upstreams found.")
             return 0
-        run_git_command(["git", "fetch", "--all", "-q"])
+        retcode = 0
+        remotes_output, _ = run_git_command(
+            ["git", "remote"], check=False
+        )
+        for remote in remotes_output.split():
+            if not remote:
+                continue
+            _, fetch_rc = run_git_command(
+                ["git", "fetch", "-q", remote], check=False
+            )
+            if fetch_rc != 0:
+                print(
+                    f"Fetch failed for remote {format_branch_name(remote)}",
+                    file=sys.stderr,
+                )
+                retcode = 1
         merge_bases = {}
         for branch, parent in branch_tree.items():
             mb_output, mb_rc = run_git_command(
@@ -177,7 +192,6 @@ def main() -> int:
             )
         sorted_branches = topo_iter(branch_tree)
         unrebased_branches = []
-        retcode = 0
         for branch, parent in sorted_branches:
             if not rebase_branch(branch, parent, merge_bases[branch]):
                 retcode = 1
