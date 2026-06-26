@@ -90,7 +90,7 @@ _RELEASE_PROMPTS = _Prompts(
 # The number of chacters is in theory larger than this but in practice this
 # is a safe limit since code likely requires more tokens to encode than normal
 # text.
-_MAX_CONTEXT = 100_000
+_MAX_CONTEXT = 300_000
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 
