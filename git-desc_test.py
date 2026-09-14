@@ -4,7 +4,11 @@
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
+import tempfile
+import threading
 import unittest
+from unittest import mock
 
 # Import git-desc as a module despite the hyphen and missing .py extension.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,390 +20,341 @@ gd = importlib.util.module_from_spec(_spec)
 _loader.exec_module(gd)
 
 
-_DIFF_A = (
-    "diff --git a/foo.go b/foo.go\n"
-    "--- a/foo.go\n"
-    "+++ b/foo.go\n"
-    "@@ -1,3 +1,3 @@\n"
-    "-old\n"
-    "+new\n"
-)
-
-_DIFF_TEST = (
-    "diff --git a/foo_test.go b/foo_test.go\n"
-    "--- a/foo_test.go\n"
-    "+++ b/foo_test.go\n"
-    "@@ -1,3 +1,3 @@\n"
-    "-old test\n"
-    "+new test\n"
-)
-
-_DIFF_JSON = (
-    "diff --git a/data.json b/data.json\n"
-    "--- a/data.json\n"
-    "+++ b/data.json\n"
-    "@@ -1,3 +1,3 @@\n"
-    '-{"a":1}\n'
-    '+{"a":2}\n'
-)
-
-_DIFF_YAML = (
-    "diff --git a/config.yaml b/config.yaml\n"
-    "--- a/config.yaml\n"
-    "+++ b/config.yaml\n"
-    "@@ -1,3 +1,3 @@\n"
-    "-key: old\n"
-    "+key: new\n"
-)
-
-_DIFF_ALL = _DIFF_A + _DIFF_TEST + _DIFF_JSON + _DIFF_YAML
+def _diff(path, body, extra=""):
+    """Return git diff output for one file with one hunk."""
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"{extra}"
+        "index 1111111..2222222 100644\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1,2 +1,2 @@ func\n"
+        f"{body}"
+    )
 
 
-class TestFilterDiff(unittest.TestCase):
-    """Tests for _filter_diff and filter_diff."""
-
-    def test_filter_by_prefix(self):
-        result = gd.filter_diff(_DIFF_ALL, ["data.json"])
-        self.assertIn("foo.go", result)
-        self.assertIn("foo_test.go", result)
-        self.assertNotIn("data.json", result)
-        self.assertIn("config.yaml", result)
-
-    def test_filter_test_files(self):
-        result = gd._filter_diff(_DIFF_ALL, gd._is_test_file)
-        self.assertIn("foo.go", result)
-        self.assertNotIn("foo_test.go", result)
-        self.assertIn("data.json", result)
-
-    def test_filter_data_files(self):
-        result = gd._filter_diff(_DIFF_ALL, gd._is_data_file)
-        self.assertIn("foo.go", result)
-        self.assertIn("foo_test.go", result)
-        self.assertNotIn("data.json", result)
-        self.assertNotIn("config.yaml", result)
-
-    def test_filter_empty_excludes(self):
-        result = gd.filter_diff(_DIFF_ALL, [])
-        self.assertEqual(result, _DIFF_ALL)
+def _file(path, lines, context=0):
+    """Return a FileDiff with one hunk of added lines surrounded by context."""
+    ctx = tuple(f" ctx{i}\n" for i in range(context))
+    body = ctx + tuple(lines) + ctx
+    return gd.FileDiff(
+        path, f"diff --git a/{path} b/{path}\n", (gd.Hunk(1, 1, "", body),)
+    )
 
 
-class TestIsTestFile(unittest.TestCase):
-    """Tests for _is_test_file."""
+class TestParseDiff(unittest.TestCase):
+    def test_preamble_and_file(self):
+        preamble, files = gd.parse_diff(
+            "commit abc\n\n    Subject\n\n" + _diff("a.go", " x\n-old\n+new\n")
+        )
+        self.assertEqual(preamble, "commit abc\n\n    Subject")
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].path, "a.go")
+        self.assertEqual(files[0].hunks[0].section, " func")
 
-    def test_go_test(self):
+    def test_render_drops_index_and_file_lines(self):
+        _, files = gd.parse_diff(_diff("a.go", " x\n-old\n+new\n"))
+        self.assertEqual(
+            files[0].render(),
+            "diff --git a/a.go b/a.go\n@@ -1,2 +1,2 @@ func\n x\n-old\n+new\n",
+        )
+
+    def test_deleted_file_omitted(self):
+        _, files = gd.parse_diff(
+            _diff("a.go", "-old\n", extra="deleted file mode 100644\n")
+        )
+        self.assertEqual(
+            files[0].render(),
+            "diff --git a/a.go b/a.go\ndeleted file mode 100644\n(content omitted)\n",
+        )
+
+    def test_lock_files_omitted(self):
+        for path in ("go.sum", "sub/Cargo.lock", "package-lock.json"):
+            _, files = gd.parse_diff(_diff(path, "+x\n"))
+            self.assertTrue(files[0].omitted, path)
+
+    def test_long_line_truncated(self):
+        _, files = gd.parse_diff(_diff("a.go", "+" + "x" * 5000 + "\n"))
+        line = files[0].hunks[0].lines[0]
+        self.assertEqual(len(line), gd._MAX_LINE + len(" [truncated]\n"))
+
+    def test_missing_final_newline(self):
+        _, files = gd.parse_diff(_diff("a.go", "-old\n+new"))
+        self.assertEqual(files[0].hunks[0].lines, ("-old\n", "+new\n"))
+
+    def test_multiple_files(self):
+        _, files = gd.parse_diff(_diff("a.go", "+a\n") + _diff("b.go", "+b\n"))
+        self.assertEqual([f.path for f in files], ["a.go", "b.go"])
+
+    def test_noprefix_path(self):
+        _, files = gd.parse_diff("diff --git a.go a.go\n@@ -1 +1 @@\n+x\n")
+        self.assertEqual(files[0].path, "a.go")
+
+    def test_malformed_hunk_header(self):
+        with self.assertRaises(gd.Error):
+            gd.parse_diff("diff --git a/a b/a\n@@ bogus\n")
+
+
+class TestFileClassification(unittest.TestCase):
+    def test_test_file(self):
         self.assertTrue(gd._is_test_file("pkg/foo_test.go"))
-
-    def test_python_test(self):
         self.assertTrue(gd._is_test_file("test_foo.py"))
-
-    def test_normal_file(self):
         self.assertFalse(gd._is_test_file("pkg/foo.go"))
-
-    def test_test_directory(self):
-        # basename is "helper.go", not a test file.
         self.assertFalse(gd._is_test_file("testdata/helper.go"))
 
-
-class TestIsDataFile(unittest.TestCase):
-    """Tests for _is_data_file."""
-
-    def test_json(self):
+    def test_data_file(self):
         self.assertTrue(gd._is_data_file("foo.json"))
-
-    def test_yaml(self):
         self.assertTrue(gd._is_data_file("foo.yaml"))
-
-    def test_yml(self):
         self.assertTrue(gd._is_data_file("foo.yml"))
-
-    def test_go(self):
         self.assertFalse(gd._is_data_file("foo.go"))
 
 
-class TestSplitDiff(unittest.TestCase):
-    """Tests for _split_diff."""
-
-    def test_single_chunk(self):
-        chunks = gd._split_diff(_DIFF_ALL, 100_000)
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0], _DIFF_ALL)
-
-    def test_multiple_chunks(self):
-        # Force each file into its own chunk by setting max_chunk tiny.
-        chunks = gd._split_diff(_DIFF_ALL, 1)
-        self.assertEqual(len(chunks), 4)
-        self.assertIn("foo.go", chunks[0])
-        self.assertIn("foo_test.go", chunks[1])
-
-    def test_empty_diff(self):
-        chunks = gd._split_diff("", 100)
-        self.assertEqual(len(chunks), 1)
-
-    def test_grouping(self):
-        # Two small diffs should be grouped together.
-        two = _DIFF_A + _DIFF_TEST
-        chunks = gd._split_diff(two, len(two) + 10)
-        self.assertEqual(len(chunks), 1)
-
-
-class TestBuildContext(unittest.TestCase):
-    """Tests for _build_context."""
-
-    def test_with_metadata(self):
-        ctx = gd._build_context("meta\n", "diff")
-        self.assertEqual(ctx, "meta\n=== Changes ===\ndiff")
-
-    def test_without_metadata(self):
-        ctx = gd._build_context("", "diff")
-        self.assertEqual(ctx, "=== Changes ===\ndiff")
-
-
-class TestExtractPath(unittest.TestCase):
-    """Tests for _extract_path."""
-
-    def test_standard_prefix(self):
-        self.assertEqual(
-            gd._extract_path("diff --git a/foo.go b/foo.go"), "foo.go"
-        )
-
-    def test_noprefix(self):
-        self.assertEqual(
-            gd._extract_path("diff --git foo.go foo.go"), "foo.go"
-        )
-
-
-def _make_hunk(leading_ctx, trailing_ctx, middle_ctx=0):
-    """Build a diff with configurable context line counts around a change."""
-    lines = []
-    lines.append("diff --git a/f.go b/f.go\n")
-    lines.append("--- a/f.go\n")
-    lines.append("+++ b/f.go\n")
-    old_count = leading_ctx + 1 + trailing_ctx + middle_ctx
-    new_count = leading_ctx + 1 + trailing_ctx + middle_ctx
-    if middle_ctx:
-        # Two changes with middle context between them.
-        old_count += 1
-        new_count += 1
-    lines.append(f"@@ -1,{old_count} +1,{new_count} @@\n")
-    for i in range(leading_ctx):
-        lines.append(f" lead{i}\n")
-    lines.append("-old\n")
-    lines.append("+new\n")
-    if middle_ctx:
-        for i in range(middle_ctx):
-            lines.append(f" mid{i}\n")
-        lines.append("-old2\n")
-        lines.append("+new2\n")
-    for i in range(trailing_ctx):
-        lines.append(f" trail{i}\n")
-    return "".join(lines)
-
-
-class TestTrimHunkContext(unittest.TestCase):
-    """Tests for _trim_hunk_context."""
+class TestHunkWithContext(unittest.TestCase):
+    def _trim(self, lines, n):
+        return gd.Hunk(10, 20, "", tuple(lines)).with_context(n)
 
     def test_no_context(self):
         body = ["-old\n", "+new\n"]
-        trimmed, lead = gd._trim_hunk_context(body, 3)
-        self.assertEqual(trimmed, body)
-        self.assertEqual(lead, 0)
+        self.assertEqual(self._trim(body, 3).lines, tuple(body))
 
     def test_leading_trimmed(self):
-        body = [" a\n", " b\n", " c\n", " d\n", " e\n", "-old\n", "+new\n"]
-        trimmed, lead = gd._trim_hunk_context(body, 2)
-        self.assertEqual(lead, 3)
-        self.assertEqual(trimmed, [" d\n", " e\n", "-old\n", "+new\n"])
+        hunk = self._trim([" a\n", " b\n", " c\n", " d\n", " e\n", "-old\n"], 2)
+        self.assertEqual(hunk.lines, (" d\n", " e\n", "-old\n"))
+        self.assertEqual((hunk.old_start, hunk.new_start), (13, 23))
 
     def test_trailing_trimmed(self):
-        body = ["-old\n", "+new\n", " a\n", " b\n", " c\n", " d\n", " e\n"]
-        trimmed, lead = gd._trim_hunk_context(body, 2)
-        self.assertEqual(lead, 0)
-        self.assertEqual(trimmed, ["-old\n", "+new\n", " a\n", " b\n"])
+        hunk = self._trim(["-old\n", " a\n", " b\n", " c\n", " d\n"], 2)
+        self.assertEqual(hunk.lines, ("-old\n", " a\n", " b\n"))
+        self.assertEqual((hunk.old_start, hunk.new_start), (10, 20))
 
-    def test_both_sides(self):
-        body = [
-            " l1\n", " l2\n", " l3\n", " l4\n",
-            "-old\n", "+new\n",
-            " t1\n", " t2\n", " t3\n", " t4\n",
-        ]
-        trimmed, lead = gd._trim_hunk_context(body, 2)
-        self.assertEqual(lead, 2)
+    def test_middle_trimmed(self):
+        middle = [f" m{i}\n" for i in range(10)]
+        hunk = self._trim(["-old1\n", *middle, "-old2\n"], 2)
         self.assertEqual(
-            trimmed,
-            [" l3\n", " l4\n", "-old\n", "+new\n", " t1\n", " t2\n"],
+            hunk.lines, ("-old1\n", " m0\n", " m1\n", " m8\n", " m9\n", "-old2\n")
         )
 
-    def test_middle_context_trimmed(self):
-        body = [
-            "-old1\n", "+new1\n",
-            " m0\n", " m1\n", " m2\n", " m3\n", " m4\n",
-            " m5\n", " m6\n", " m7\n", " m8\n", " m9\n",
-            "-old2\n", "+new2\n",
-        ]
-        trimmed, lead = gd._trim_hunk_context(body, 2)
-        self.assertEqual(lead, 0)
-        self.assertEqual(
-            trimmed,
-            [
-                "-old1\n", "+new1\n",
-                " m0\n", " m1\n",
-                " m8\n", " m9\n",
-                "-old2\n", "+new2\n",
-            ],
-        )
+    def test_short_middle_kept(self):
+        body = ["-old1\n", " m0\n", " m1\n", " m2\n", "-old2\n"]
+        self.assertEqual(self._trim(body, 2).lines, tuple(body))
 
-    def test_middle_context_short_kept(self):
-        body = [
-            "-old1\n", "+new1\n",
-            " m0\n", " m1\n", " m2\n",
-            "-old2\n", "+new2\n",
-        ]
-        trimmed, _ = gd._trim_hunk_context(body, 2)
-        self.assertEqual(trimmed, body)
-
-    def test_empty(self):
-        trimmed, lead = gd._trim_hunk_context([], 3)
-        self.assertEqual(trimmed, [])
-        self.assertEqual(lead, 0)
+    def test_zero_context(self):
+        hunk = self._trim([" a\n", "-old\n", " b\n", "+new\n", " c\n"], 0)
+        self.assertEqual(hunk.lines, ("-old\n", "+new\n"))
+        self.assertEqual(hunk.header(), "@@ -11,1 +21,1 @@\n")
 
     def test_no_newline_marker_kept(self):
         body = ["-old\n", "+new\n", "\\ No newline at end of file\n"]
-        trimmed, _ = gd._trim_hunk_context(body, 3)
-        self.assertEqual(trimmed, body)
+        self.assertEqual(self._trim(body, 3).lines, tuple(body))
 
 
-class TestReduceDiffContext(unittest.TestCase):
-    """Tests for _reduce_diff_context."""
+class TestHunkSplit(unittest.TestCase):
+    def test_split(self):
+        lines = tuple(f"+line{i:03}\n" for i in range(100))
+        hunks = gd.Hunk(1, 1, " func", lines).split(200)
+        self.assertGreater(len(hunks), 1)
+        for hunk in hunks:
+            self.assertLessEqual(len(hunk.render()), 200)
+        self.assertEqual(tuple(l for h in hunks for l in h.lines), lines)
+        self.assertEqual(hunks[1].old_start, 1)
+        self.assertEqual(hunks[1].new_start, 1 + len(hunks[0].lines))
 
-    def test_reduces_leading_trailing(self):
-        diff = _make_hunk(10, 10)
-        result = gd._reduce_diff_context(diff, 3)
-        # Should have 3 leading + change + 3 trailing context lines.
-        hunk_lines = [
-            l for l in result.splitlines()
-            if l.startswith((" ", "+", "-")) and not l.startswith("+++")
-            and not l.startswith("---")
+
+class TestPack(unittest.TestCase):
+    def test_fits(self):
+        self.assertEqual(gd.pack(["a", "b"], 10), [["a", "b"]])
+
+    def test_balanced(self):
+        groups = gd.pack(["x" * 10] * 18, 100)
+        self.assertEqual([len(g) for g in groups], [9, 9])
+
+    def test_oversized_item_alone(self):
+        items = ["a" * 5, "b" * 50, "c" * 5]
+        self.assertEqual(gd.pack(items, 20), [[items[0]], [items[1]], [items[2]]])
+
+    def test_empty(self):
+        self.assertEqual(gd.pack([], 10), [])
+
+
+class TestSplitDiff(unittest.TestCase):
+    def test_small_files_grouped(self):
+        files = [_file("a.go", ["+a\n"]), _file("b.go", ["+b\n"])]
+        self.assertEqual(
+            gd.split_diff(files, 1000), ["".join(f.render() for f in files)]
+        )
+
+    def test_large_file_split_with_header(self):
+        f = _file("big.go", [f"+line{i:04}\n" for i in range(500)])
+        parts = gd.split_diff([f], 1000)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            self.assertLessEqual(len(part), 1000)
+            self.assertTrue(part.startswith(f.header))
+        text = "".join(parts)
+        for line in f.hunks[0].lines:
+            self.assertIn(line, text)
+
+
+class TestReduceDiff(unittest.TestCase):
+    def test_stops_when_it_fits(self):
+        files = [_file("a.go", ["+a\n"], context=10), _file("a_test.go", ["+t\n"])]
+        reduced = gd.reduce_diff(files, 200)
+        self.assertLessEqual(sum(len(f.render()) for f in reduced), 200)
+        self.assertEqual(len(reduced[0].hunks[0].lines), 7)
+        self.assertFalse(reduced[1].omitted)
+
+    def test_omits_tests_then_data(self):
+        files = [
+            _file("a.go", ["+a\n"], context=10),
+            _file("a_test.go", ["+t\n"]),
+            _file("c.yaml", ["+c\n"]),
         ]
-        leading = [l for l in hunk_lines if l.startswith(" lead")]
-        trailing = [l for l in hunk_lines if l.startswith(" trail")]
-        self.assertEqual(len(leading), 3)
-        self.assertEqual(len(trailing), 3)
-
-    def test_updates_hunk_header(self):
-        diff = _make_hunk(10, 10)
-        result = gd._reduce_diff_context(diff, 3)
-        for line in result.splitlines():
-            if line.startswith("@@"):
-                # old_start should be 1 + 7 = 8 (trimmed 7 leading lines).
-                self.assertIn("-8,", line)
-                break
-        else:
-            self.fail("no @@ header found")
-
-    def test_noop_when_already_small(self):
-        diff = _make_hunk(2, 2)
-        result = gd._reduce_diff_context(diff, 3)
-        self.assertEqual(result, diff)
-
-    def test_middle_context_trimmed(self):
-        diff = _make_hunk(3, 3, middle_ctx=20)
-        result = gd._reduce_diff_context(diff, 3)
-        mid_lines = [
-            l for l in result.splitlines() if l.startswith(" mid")
-        ]
-        self.assertEqual(len(mid_lines), 6)  # 3 + 3
-
-    def test_preserves_file_headers(self):
-        diff = _make_hunk(10, 10)
-        result = gd._reduce_diff_context(diff, 3)
-        self.assertIn("diff --git a/f.go b/f.go", result)
-        self.assertIn("--- a/f.go", result)
-        self.assertIn("+++ b/f.go", result)
-
-    def test_multiple_files(self):
-        diff = _make_hunk(10, 10) + _make_hunk(10, 10)
-        result = gd._reduce_diff_context(diff, 3)
-        # Both files should be present and trimmed.
-        self.assertEqual(result.count("diff --git"), 2)
-        ctx = [
-            l for l in result.splitlines()
-            if l.startswith(" lead") or l.startswith(" trail")
-        ]
-        # 2 files * (3 lead + 3 trail) = 12.
-        self.assertEqual(len(ctx), 12)
-
-    def test_empty_diff(self):
-        self.assertEqual(gd._reduce_diff_context("", 3), "")
+        reduced = gd.reduce_diff(files, 0)
+        self.assertEqual([f.omitted for f in reduced], [False, True, True])
 
 
-class TestGatherReleaseMetadata(unittest.TestCase):
-    """Tests for _gather_release_metadata."""
+class _FakeAsk:
+    """Records requests and answers with reply(prompt, data)."""
 
-    def test_includes_full_commit_log(self):
-        """Verify _gather_release_metadata requests the full commit log."""
-        calls = []
-        orig = gd.run_git_command
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+        self._lock = threading.Lock()
 
-        def fake_run(cmd, check=True):
-            calls.append(cmd)
-            return ("fake output", 0)
+    def __call__(self, prompt, data):
+        with self._lock:
+            self.calls.append((prompt, data))
+        return self.reply(prompt, data)
 
-        gd.run_git_command = fake_run
-        try:
-            result = gd._gather_release_metadata("abc123", [])
-        finally:
-            gd.run_git_command = orig
+    def prompts(self):
+        return [prompt for prompt, _ in self.calls]
 
-        # Should include a git log call without -N limit (full history).
-        log_cmds = [c for c in calls if "log" in c]
-        self.assertTrue(len(log_cmds) >= 2, f"Expected >=2 log commands, got {log_cmds}")
-        # No -N limit on the log commands.
-        for cmd in log_cmds:
-            for arg in cmd:
-                self.assertFalse(
-                    arg.startswith("-") and arg[1:].isdigit(),
-                    f"Unexpected limit arg {arg} in {cmd}",
-                )
-        # Result should contain the full commit messages section.
-        self.assertIn("Full Commit Messages", result)
 
-    def test_excludes_paths(self):
-        """Verify pathspec excludes are passed to diff --stat."""
-        calls = []
-        orig = gd.run_git_command
+_PROMPTS = gd.Prompts(whole="WHOLE", part="PART", final="FINAL")
+_BUDGET = 20_000
 
-        def fake_run(cmd, check=True):
-            calls.append(cmd)
-            return ("fake output", 0)
 
-        gd.run_git_command = fake_run
-        try:
-            gd._gather_release_metadata("abc123", ["vendor/"])
-        finally:
-            gd.run_git_command = orig
+def _source(files, context="=== Branch ===\nfeature\n\n"):
+    return gd.Source(context=context, brief=context, files=files)
 
-        stat_cmds = [c for c in calls if "--stat" in c]
-        self.assertEqual(len(stat_cmds), 1)
-        self.assertIn(":(exclude)vendor/", stat_cmds[0])
 
-    def test_no_commits_section_when_empty(self):
-        """Verify empty log produces no Commits section."""
-        orig = gd.run_git_command
+def _big_files(count=10):
+    return [_file(f"f{i}.go", [f"+{i} line{j:03}\n" for j in range(400)]) for i in range(count)]
 
-        def fake_run(cmd, check=True):
-            if "log" in cmd:
-                return ("", 0)
-            return ("some stat", 0)
 
-        gd.run_git_command = fake_run
-        try:
-            result = gd._gather_release_metadata("abc123", [])
-        finally:
-            gd.run_git_command = orig
+class TestDescribe(unittest.TestCase):
+    def test_whole(self):
+        ask = _FakeAsk(lambda prompt, data: "message")
+        result = gd.describe(_source([_file("a.go", ["+a\n"])]), _PROMPTS, _BUDGET, ask)
+        self.assertEqual(result, "message")
+        self.assertEqual(ask.prompts(), ["WHOLE"])
+        self.assertIn("=== Branch ===", ask.calls[0][1])
+        self.assertIn("+a\n", ask.calls[0][1])
 
-        self.assertNotIn("=== Commits ===", result)
-        self.assertNotIn("=== Full Commit Messages ===", result)
-        self.assertIn("=== Files Changed ===", result)
+    def test_split(self):
+        files = _big_files()
+        ask = _FakeAsk(lambda prompt, data: "final" if prompt == "FINAL" else "summary")
+        result = gd.describe(_source(files), _PROMPTS, _BUDGET, ask)
+        self.assertEqual(result, "final")
+        prompts = ask.prompts()
+        self.assertGreater(prompts.count("PART"), 1)
+        self.assertEqual(prompts[-1], "FINAL")
+        for _, data in ask.calls:
+            self.assertLessEqual(len(data), _BUDGET)
+        parts = "".join(data for prompt, data in ask.calls if prompt == "PART")
+        for f in files:
+            self.assertIn(f.hunks[0].lines[-1], parts)
+        self.assertIn("=== Part summaries ===\nsummary", ask.calls[-1][1])
+
+    def test_merges_long_summaries(self):
+        replies = {"PART": "s" * 8000, gd._MERGE_PROMPT: "merged", "FINAL": "final"}
+        ask = _FakeAsk(lambda prompt, data: replies[prompt])
+        result = gd.describe(_source(_big_files()), _PROMPTS, _BUDGET, ask)
+        self.assertEqual(result, "final")
+        self.assertIn(gd._MERGE_PROMPT, ask.prompts())
+        for _, data in ask.calls:
+            self.assertLessEqual(len(data), _BUDGET)
+
+    def test_merge_without_progress(self):
+        ask = _FakeAsk(lambda prompt, data: "s" * 30_000)
+        with self.assertRaises(gd.Error):
+            gd.describe(_source(_big_files()), _PROMPTS, _BUDGET, ask)
+
+    def test_ask_error(self):
+        def reply(prompt, data):
+            raise gd.Error("boom")
+
+        with self.assertRaisesRegex(gd.Error, "boom"):
+            gd.describe(_source(_big_files()), _PROMPTS, _BUDGET, _FakeAsk(reply))
+
+    def test_no_changes(self):
+        with self.assertRaises(gd.Error):
+            gd.describe(_source([]), _PROMPTS, _BUDGET, _FakeAsk(None))
+
+    def test_metadata_too_large(self):
+        source = _source([_file("a.go", ["+a\n"])], context="x" * _BUDGET)
+        with self.assertRaises(gd.Error):
+            gd.describe(source, _PROMPTS, _BUDGET, _FakeAsk(None))
+
+
+class TestStdinSource(unittest.TestCase):
+    def test_header_and_excludes(self):
+        text = "commit abc\n\n" + _diff("a.go", "+a\n") + _diff("vendor/b.go", "+b\n")
+        source = gd.stdin_source(text, ["vendor/"])
+        self.assertEqual(source.context, "=== Input header ===\ncommit abc\n\n")
+        self.assertEqual([f.path for f in source.files], ["a.go"])
+
+
+class TestGitSource(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.com",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        cwd = os.getcwd()
+        os.chdir(tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        self._git("init", "-q", "-b", "main")
+        self._commit("a.go", "one\n", "Upstream subject")
+        self._git("checkout", "-q", "-b", "feature", "--track", "main")
+        os.mkdir("vendor")
+        self._commit("vendor/v.go", "vendored\n", "Add vendor")
+        self._commit("a.go", "two\n", "Feature subject\n\nFeature body")
+
+    def _git(self, *args):
+        subprocess.run(["git", *args], check=True, capture_output=True)
+
+    def _commit(self, path, content, message):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self._git("add", path)
+        self._git("commit", "-q", "-m", message)
+
+    def test_commit(self):
+        source = gd.git_source(None, False, ["vendor/"])
+        self.assertEqual([f.path for f in source.files], ["a.go"])
+        self.assertIn("=== Branch ===\nfeature\n", source.context)
+        self.assertIn("Upstream subject", source.context)
+        self.assertNotIn("Upstream subject", source.brief)
+        self.assertNotIn("v.go", source.context)
+
+    def test_release(self):
+        source = gd.git_source("main", True, [])
+        self.assertEqual([f.path for f in source.files], ["a.go", "vendor/v.go"])
+        self.assertIn("Feature body", source.context)
+        self.assertNotIn("Feature body", source.brief)
+        self.assertIn("Feature subject", source.brief)
 
 
 if __name__ == "__main__":

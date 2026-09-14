@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""git desc: Generate a commit description using an LLM.
+"""git desc: Generate a commit message or release notes using an LLM.
 
-Gathers the diff between the current branch and its upstream merge-base,
-along with context (branch name, changed files, recent upstream commits),
-and sends it to the 'ask' tool to generate a commit message.
+Collects the diff between HEAD and its merge-base with the upstream (or
+--base) plus git metadata, drops content that does not describe the change,
+and sends the result to the 'ask' tool. When the input exceeds the context
+budget, the diff is split into balanced parts that are summarized in
+parallel, then combined.
 
 Designed to work with the squash workflow: after 'git squash', run 'git desc'
 to generate a meaningful commit message, then 'git commit --amend -F -'.
@@ -11,598 +13,542 @@ to generate a meaningful commit message, then 'git commit --amend -F -'.
 
 import argparse
 import concurrent.futures
+import dataclasses
+import functools
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
-import traceback
-import typing
+from collections.abc import Callable, Iterable
+
+# Measured 3.3 characters per token on a 330 KB Go diff with both the o200k
+# and Qwen3 tokenizers; 3 leaves a margin for denser content.
+_CHARS_PER_TOKEN = 3
+# Share of the context window kept for the prompt, reasoning and answer.
+_RESERVED_SHARE = 0.25
+_MIN_TOKENS = 8000
+_CONTEXT_LINES = 10
+_REDUCED_CONTEXT_LINES = 3
+# Longer lines are truncated; they are usually minified or generated.
+_MAX_LINE = 1000
+_MAX_WORKERS = 4
+_STAT_COUNT = 100
+
+_DATA_EXTENSIONS = (".json", ".jsonl", ".ndjson", ".yaml", ".yml")
+_LOCK_FILES = ("go.sum", "npm-shrinkwrap.json", "package-lock.json", "pnpm-lock.yaml")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$")
 
 
-class _Prompts(typing.NamedTuple):
-    main: str
-    chunk: str
-    summary: str
+class Error(Exception):
+    """A failure reported to the user without a traceback."""
 
 
-_COMMIT_PROMPTS = _Prompts(
-    main=(
-        "Write a git commit message for the changes below. Follow these rules:\n"
-        "- Subject: imperative mood, no period, max 72 chars "
-        '(e.g. "Fix timeout in retry loop")\n'
-        "- If the change is non-trivial, add a blank line then a body "
-        "explaining what and why, not how\n"
-        "- Wrap body lines at 72 chars\n"
-        "- Match the style of recent upstream commits if provided\n"
-        "- Focus on the meaningful changes; ignore ancillary updates "
-        "(imports, test data, build files, dependency bumps, formatting) "
-        "unless they are the primary purpose of the commit\n"
-        "- No emojis\n"
-        "- Output only the commit message, nothing else"
-    ),
-    chunk=(
-        "Summarize the following code changes in a few paragraphs. "
-        "Focus on what changed and why. Output a brief description."
-    ),
-    summary=(
-        "Below are descriptions of different parts of the same commit. "
-        "Write a single unified git commit message following these rules:\n"
-        "- Subject: imperative mood, no period, max 72 chars\n"
-        "- If non-trivial, add a blank line then a body explaining what and why\n"
-        "- Wrap body lines at 72 chars\n"
-        "- No emojis\n"
-        "- Output only the commit message, nothing else"
-    ),
+@dataclasses.dataclass(frozen=True)
+class Prompts:
+    """Instructions for each kind of request."""
+
+    whole: str  # Describe the complete diff.
+    part: str  # Summarize one part of a split diff.
+    final: str  # Describe the change from the part summaries.
+
+
+_COMMIT_RULES = (
+    "- Subject: imperative mood, no period, max 72 chars "
+    '(e.g. "Fix timeout in retry loop")\n'
+    "- If the change is non-trivial, add a blank line then a body "
+    "explaining what and why, not how\n"
+    "- Wrap body lines at 72 chars\n"
+    "- Match the style of recent upstream commits if provided\n"
+    "- Focus on the meaningful changes; ignore ancillary updates "
+    "(imports, tests, build files, dependency bumps, formatting) "
+    "unless they are the primary purpose of the change\n"
+    "- No emojis\n"
+    "- Output only the commit message, nothing else"
 )
 
-_RELEASE_PROMPTS = _Prompts(
-    main=(
-        "Write release notes for the changes below in Markdown. Follow these rules:\n"
-        "- Categorize changes under headings: Features, Bug Fixes, Breaking Changes, "
-        "Other (omit empty categories)\n"
-        "- Each item is a concise bullet point describing the user-facing change\n"
-        "- Derive information primarily from the commit messages, "
-        "using the diff for additional detail\n"
-        "- Ignore internal refactors, test-only changes, and dependency bumps "
-        "unless they affect users\n"
-        "- No emojis\n"
-        "- Output only the release notes, nothing else"
-    ),
-    chunk=(
-        "Summarize the following code changes for release notes. "
-        "Focus on user-facing features, bug fixes, and breaking changes. "
-        "Output a brief description."
-    ),
-    summary=(
-        "Below are summaries of different parts of the same release. "
-        "Write unified release notes in Markdown following these rules:\n"
-        "- Categorize under headings: Features, Bug Fixes, Breaking Changes, "
-        "Other (omit empty categories)\n"
-        "- Each item is a concise bullet point describing the user-facing change\n"
-        "- No emojis\n"
-        "- Output only the release notes, nothing else"
-    ),
+_RELEASE_RULES = (
+    "- Categorize changes under headings: Features, Bug Fixes, "
+    "Breaking Changes, Other (omit empty categories)\n"
+    "- Each item is a concise bullet point describing the user-facing change\n"
+    "- Derive information primarily from the commit messages, "
+    "using the code changes for additional detail\n"
+    "- Ignore internal refactors, test-only changes, and dependency bumps "
+    "unless they affect users\n"
+    "- No emojis\n"
+    "- Output only the release notes, nothing else"
 )
 
-# While many models support 200k tokens, some providers like Cerebras and Groq have models
-# that only support 120k tokens.
-# The number of chacters is in theory larger than this but in practice this
-# is a safe limit since code likely requires more tokens to encode than normal
-# text.
-_MAX_CONTEXT = 100_000
+_COMMIT_PROMPTS = Prompts(
+    whole="Write a git commit message for the change below. "
+    "Follow these rules:\n" + _COMMIT_RULES,
+    part="The input is one part of a larger change. Summarize what it "
+    "changes and why in a few short paragraphs. Output only the summary.",
+    final="Below are metadata and summaries of the parts of one change. "
+    "Write a single git commit message for the change. "
+    "Follow these rules:\n" + _COMMIT_RULES,
+)
 
-_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+_RELEASE_PROMPTS = Prompts(
+    whole="Write release notes in Markdown for the changes below. "
+    "Follow these rules:\n" + _RELEASE_RULES,
+    part="The input is one part of a larger release. Summarize its "
+    "user-facing features, bug fixes, and breaking changes in a few short "
+    "paragraphs. Output only the summary.",
+    final="Below are metadata and summaries of the parts of one release. "
+    "Write release notes in Markdown for the release. "
+    "Follow these rules:\n" + _RELEASE_RULES,
+)
+
+_MERGE_PROMPT = (
+    "Below are summaries of parts of one change. Merge them into one "
+    "summary. Keep every distinct point and drop repetition. "
+    "Output only the summary."
+)
 
 
-def run_git_command(
-    cmd: typing.List[str], check: bool = True
-) -> typing.Tuple[str, int]:
-    """Run a git command and return output and return code."""
-    result = subprocess.run(cmd, capture_output=True, text=True, check=check)
-    return result.stdout.strip(), result.returncode
+def _line_counts(lines: Iterable[str]) -> tuple[int, int]:
+    """Return the old and new line counts of hunk body lines."""
+    old = new = 0
+    for line in lines:
+        old += line[:1] in (" ", "-")
+        new += line[:1] in (" ", "+")
+    return old, new
 
 
-def get_ancestor(base: typing.Optional[str]) -> typing.Optional[str]:
-    """Get the ancestor (merge-base) between HEAD and base ref or upstream."""
-    if base:
-        # Verify the ref exists.
-        _, rc = run_git_command(["git", "rev-parse", "--verify", base], check=False)
-        if rc != 0:
-            print(f"Invalid ref: {base}", file=sys.stderr)
-            return None
-        ancestor, rc = run_git_command(["git", "merge-base", "HEAD", base], check=False)
-        return None if rc != 0 else ancestor
-    _, rc = run_git_command(["git", "rev-parse", "--abbrev-ref", "@{u}"], check=False)
-    if rc != 0:
-        return None
-    ancestor, rc = run_git_command(["git", "merge-base", "HEAD", "@{u}"], check=False)
-    return None if rc != 0 else ancestor
+@dataclasses.dataclass(frozen=True)
+class Hunk:
+    """One hunk of a file diff."""
+
+    old_start: int
+    new_start: int
+    section: str  # Text after the closing "@@", usually the enclosing function.
+    lines: tuple[str, ...]  # Body lines, each ending with a newline.
+
+    def header(self) -> str:
+        """Return the "@@" line with counts matching the body."""
+        old, new = _line_counts(self.lines)
+        return f"@@ -{self.old_start},{old} +{self.new_start},{new} @@{self.section}\n"
+
+    def render(self) -> str:
+        """Return the hunk as unified diff text."""
+        return self.header() + "".join(self.lines)
+
+    def with_context(self, n: int) -> "Hunk":
+        """Return the hunk with at most n context lines around each change."""
+        keep = [True] * len(self.lines)
+        lead = 0
+        i = 0
+        while i < len(self.lines):
+            if self.lines[i][:1] != " ":
+                i += 1
+                continue
+            start = i
+            while i < len(self.lines) and self.lines[i][:1] == " ":
+                i += 1
+            if start == 0:
+                drop = range(i - n)
+                lead = len(drop)
+            elif i == len(self.lines):
+                drop = range(start + n, i)
+            else:
+                drop = range(start + n, i - n)
+            for k in drop:
+                keep[k] = False
+        lines = tuple(line for line, k in zip(self.lines, keep) if k)
+        return Hunk(self.old_start + lead, self.new_start + lead, self.section, lines)
+
+    def split(self, limit: int) -> list["Hunk"]:
+        """Split between lines into hunks of at most limit chars each."""
+        # Split hunks start at higher line numbers, which may add digits.
+        room = limit - len(self.header()) - 8
+        hunks: list[Hunk] = []
+        old, new = self.old_start, self.new_start
+        for group in pack(list(self.lines), room):
+            hunks.append(Hunk(old, new, self.section, tuple(group)))
+            old_count, new_count = _line_counts(group)
+            old += old_count
+            new += new_count
+        return hunks
+
+
+@dataclasses.dataclass(frozen=True)
+class FileDiff:
+    """The diff of one file."""
+
+    path: str
+    header: str  # The "diff --git" line and extended headers such as renames.
+    hunks: tuple[Hunk, ...]
+    omitted: bool = False  # True when the hunks were dropped.
+
+    def render(self) -> str:
+        """Return the file as unified diff text."""
+        if self.omitted:
+            return self.header + "(content omitted)\n"
+        return self.header + "".join(h.render() for h in self.hunks)
+
+    def omit(self) -> "FileDiff":
+        """Return the file without its hunks."""
+        if not self.hunks:
+            return self
+        return dataclasses.replace(self, hunks=(), omitted=True)
+
+    def with_context(self, n: int) -> "FileDiff":
+        """Return the file with at most n context lines around each change."""
+        return dataclasses.replace(
+            self, hunks=tuple(h.with_context(n) for h in self.hunks)
+        )
+
+    def split(self, limit: int) -> list[str]:
+        """Render as pieces of at most limit chars, each starting with the header."""
+        text = self.render()
+        if len(text) <= limit:
+            return [text]
+        room = limit - len(self.header)
+        hunks = [h.render() for big in self.hunks for h in big.split(room)]
+        return [self.header + "".join(group) for group in pack(hunks, room)]
 
 
 def _extract_path(diff_line: str) -> str:
-    """Extract the file path from a 'diff --git' line.
+    """Extract the file path from a "diff --git" line.
 
     Handles both prefixed ("diff --git a/foo b/foo") and noprefix
     ("diff --git foo foo") formats.
     """
-    # Try standard a/ b/ prefix first.
-    parts = diff_line.split(" b/", 1)
+    parts = diff_line.rstrip("\n").split(" b/", 1)
     if len(parts) == 2:
-        return parts[1].rstrip()
-    # Noprefix: "diff --git foo bar" — take the last space-separated token.
-    tokens = diff_line.rstrip().split()
+        return parts[1]
+    tokens = diff_line.split()
     return tokens[-1] if len(tokens) >= 4 else ""
 
 
-def _filter_diff(diff: str, should_exclude: typing.Callable[[str], bool]) -> str:
-    """Filter a unified diff, dropping hunks for files matching predicate."""
-    chunks: typing.List[str] = []
-    current: typing.List[str] = []
-    skip = False
-    for line in diff.splitlines(True):
-        if line.startswith("diff --git "):
-            if current and not skip:
-                chunks.append("".join(current))
-            current = [line]
-            path = _extract_path(line)
-            skip = should_exclude(path)
-        else:
-            current.append(line)
-    if current and not skip:
-        chunks.append("".join(current))
-    return "".join(chunks)
-
-
-def filter_diff(diff: str, excludes: typing.List[str]) -> str:
-    """Filter a unified diff, dropping hunks for files matching excludes."""
-    if not excludes:
-        return diff
-    return _filter_diff(diff, lambda p: any(p.startswith(e) for e in excludes))
+def _clip(line: str) -> str:
+    """Truncate a line to _MAX_LINE chars and end it with a newline."""
+    line = line.rstrip("\n")
+    if len(line) > _MAX_LINE:
+        line = line[:_MAX_LINE] + " [truncated]"
+    return line + "\n"
 
 
 def _is_test_file(path: str) -> bool:
-    """Check if a path looks like a test file."""
     return "test" in os.path.basename(path).lower()
 
 
 def _is_data_file(path: str) -> bool:
-    """Check if a path is a JSON or YAML file."""
-    return os.path.splitext(path)[1].lower() in (
-        ".json",
-        ".jsonl",
-        ".ndjson",
-        ".yaml",
-        ".yml",
-    )
+    return os.path.splitext(path)[1].lower() in _DATA_EXTENSIONS
 
 
-def _trim_hunk_context(
-    body: typing.List[str], target: int
-) -> typing.Tuple[typing.List[str], int]:
-    """Trim context lines in a hunk body to at most *target* per side.
+def _is_lock_file(path: str) -> bool:
+    name = os.path.basename(path)
+    return name in _LOCK_FILES or name.endswith(".lock")
 
-    Returns (trimmed_lines, leading_context_lines_removed).
+
+def parse_diff(text: str) -> tuple[str, list[FileDiff]]:
+    """Parse git diff output into the text before the first file and the files.
+
+    Drops content that does not describe the change: index and ---/+++
+    lines, deleted and lock file contents, and the tail of long lines.
     """
-    if not body:
-        return body, 0
-
-    is_ctx = [line[:1] == " " for line in body]
-
-    # Identify runs of consecutive context lines: (start, end).
-    runs: typing.List[typing.Tuple[int, int]] = []
-    j = 0
-    while j < len(body):
-        if is_ctx[j]:
-            start = j
-            while j < len(body) and is_ctx[j]:
-                j += 1
-            runs.append((start, j))
-        else:
-            j += 1
-
-    if not runs:
-        return body, 0
-
-    keep = [True] * len(body)
-    lead_cut = 0
-
-    for start, end in runs:
-        run_len = end - start
-        at_top = start == 0
-        at_bottom = end == len(body)
-        if at_top:
-            # Leading context — keep last *target* lines.
-            excess = run_len - target
-            if excess > 0:
-                for k in range(start, start + excess):
-                    keep[k] = False
-                lead_cut = excess
-        elif at_bottom:
-            # Trailing context — keep first *target* lines.
-            if run_len > target:
-                for k in range(start + target, end):
-                    keep[k] = False
-        else:
-            # Middle context — keep first *target* + last *target*.
-            if run_len > 2 * target:
-                for k in range(start + target, end - target):
-                    keep[k] = False
-
-    trimmed = [line for line, k in zip(body, keep) if k]
-    return trimmed, lead_cut
+    preamble, *blocks = re.split(r"^(?=diff --git )", text, flags=re.MULTILINE)
+    return preamble.strip(), [_parse_file(block) for block in blocks]
 
 
-def _reduce_diff_context(diff: str, target: int) -> str:
-    """Reduce context lines in a unified diff to *target* lines per hunk side."""
-    result: typing.List[str] = []
-    lines = diff.splitlines(True)
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Pass through everything that is not a hunk header.
-        if not line.startswith("@@"):
-            result.append(line)
-            i += 1
-            continue
+def _parse_file(block: str) -> FileDiff:
+    first, *rest = block.splitlines(keepends=True)
+    path = _extract_path(first)
+    header = [_clip(first)]
+    hunks: list[tuple[re.Match[str], list[str]]] = []
+    for line in rest:
+        if line.startswith("@@"):
+            m = _HUNK_RE.match(line.rstrip("\n"))
+            if not m:
+                raise Error(f"Malformed hunk header in {path}: {line.rstrip()}")
+            hunks.append((m, []))
+        elif hunks:
+            hunks[-1][1].append(_clip(line))
+        elif not line.startswith(("index ", "--- ", "+++ ")):
+            header.append(_clip(line))
+    f = FileDiff(
+        path,
+        "".join(header),
+        tuple(Hunk(int(m[1]), int(m[2]), m[3], tuple(body)) for m, body in hunks),
+    )
+    if _is_lock_file(path) or "\ndeleted file mode " in f.header:
+        return f.omit()
+    return f
 
-        m = _HUNK_RE.match(line.rstrip("\n\r"))
-        if not m:
-            result.append(line)
-            i += 1
-            continue
 
-        old_start = int(m.group(1))
-        new_start = int(m.group(3))
-        func_ctx = m.group(5)
+def pack(items: list[str], limit: int) -> list[list[str]]:
+    """Group consecutive items into balanced groups of at most limit chars.
 
-        # Collect hunk body (until next hunk header or file header).
-        i += 1
-        body: typing.List[str] = []
-        while i < len(lines) and not lines[i].startswith(("diff --git ", "@@")):
-            body.append(lines[i])
-            i += 1
+    An item longer than limit gets its own group.
+    """
+    total = sum(map(len, items))
+    target = total / max(1, math.ceil(total / limit))
+    groups: list[list[str]] = []
+    size = 0
+    for item in items:
+        # Start a new group when the item would overflow the limit or when
+        # most of it lands past the balanced target.
+        if not groups or size + len(item) > limit or size + len(item) / 2 > target:
+            groups.append([])
+            size = 0
+        groups[-1].append(item)
+        size += len(item)
+    return groups
 
-        trimmed, lead_cut = _trim_hunk_context(body, target)
-        if not trimmed:
-            continue
 
-        old_start += lead_cut
-        new_start += lead_cut
-        old_count = sum(1 for l in trimmed if l[:1] in (" ", "-"))
-        new_count = sum(1 for l in trimmed if l[:1] in (" ", "+"))
-        result.append(
-            f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{func_ctx}\n"
+def split_diff(files: Iterable[FileDiff], limit: int) -> list[str]:
+    """Split into balanced parts of at most limit chars, preferably between files."""
+    pieces = [piece for f in files for piece in f.split(limit)]
+    return ["".join(group) for group in pack(pieces, limit)]
+
+
+_REDUCTIONS: tuple[tuple[str, Callable[[FileDiff], FileDiff]], ...] = (
+    (
+        f"reducing context to {_REDUCED_CONTEXT_LINES} lines",
+        lambda f: f.with_context(_REDUCED_CONTEXT_LINES),
+    ),
+    ("omitting test files", lambda f: f.omit() if _is_test_file(f.path) else f),
+    ("omitting JSON/YAML files", lambda f: f.omit() if _is_data_file(f.path) else f),
+)
+
+
+def reduce_diff(files: list[FileDiff], limit: int) -> list[FileDiff]:
+    """Apply reductions in order until the rendered diff fits in limit chars."""
+    for description, reduction in _REDUCTIONS:
+        size = sum(len(f.render()) for f in files)
+        if size <= limit:
+            break
+        print(f"Diff is {size} chars, over {limit}; {description}", file=sys.stderr)
+        files = [reduction(f) for f in files]
+    return files
+
+
+@dataclasses.dataclass(frozen=True)
+class Source:
+    """The change to describe."""
+
+    context: str  # Metadata sent with requests that describe the change.
+    brief: str  # Shorter metadata sent with each part of a split diff.
+    files: list[FileDiff]
+
+
+def _section(title: str, body: str) -> str:
+    return f"=== {title} ===\n{body.strip()}\n\n"
+
+
+def _sections(*sections: tuple[str, str]) -> str:
+    """Format the (title, body) pairs with a non-empty body."""
+    return "".join(_section(title, body) for title, body in sections if body.strip())
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _exclude(files: list[FileDiff], excludes: list[str]) -> list[FileDiff]:
+    return [f for f in files if not f.path.startswith(tuple(excludes))]
+
+
+def git_source(base: str | None, release: bool, excludes: list[str]) -> Source:
+    """Collect the change from the merge-base with base (default: upstream) to HEAD."""
+    ancestor = _git("merge-base", "HEAD", base or "@{upstream}").strip()
+    rev_range = f"{ancestor}..HEAD"
+    pathspecs = ["--", *(f":(top,exclude){e}" for e in excludes)]
+    stat = _git("diff", "--stat", f"--stat-count={_STAT_COUNT}", rev_range, *pathspecs)
+    diff = _git(
+        "-c",
+        "diff.noprefix=false",
+        "-c",
+        "diff.mnemonicPrefix=false",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--patience",
+        "--find-renames",
+        f"-U{_CONTEXT_LINES}",
+        rev_range,
+    )
+    files = _exclude(parse_diff(diff)[1], excludes)
+    if release:
+        subjects = _git("log", "--reverse", "--format=%h %s", rev_range)
+        messages = _git("log", "--reverse", "--format=--- %h %s%n%b", rev_range)
+        return Source(
+            context=_sections(("Files changed", stat), ("Commit messages", messages)),
+            brief=_sections(("Files changed", stat), ("Commits", subjects)),
+            files=files,
         )
-        result.extend(trimmed)
-    return "".join(result)
-
-
-def _gather_metadata(ancestor: str, excludes: typing.List[str]) -> str:
-    """Gather non-diff git metadata for the LLM prompt."""
-    parts: typing.List[str] = []
-    pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
-
-    branch, _ = run_git_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    parts.append(f"=== Branch ===\n{branch}\n")
-
-    stat, _ = run_git_command(
-        ["git", "diff", "--stat", f"{ancestor}..HEAD"] + pathspecs
+    brief = _sections(
+        ("Branch", _git("rev-parse", "--abbrev-ref", "HEAD")),
+        ("Files changed", stat),
+        ("Commits", _git("log", "-5", "--oneline", rev_range)),
     )
-    parts.append(f"=== Files Changed ===\n{stat}\n")
-
-    log, _ = run_git_command(["git", "log", "-5", "--oneline", f"{ancestor}..HEAD"])
-    if log:
-        parts.append(f"=== Commits ===\n{log}\n")
-
-    upstream_log, _ = run_git_command(["git", "log", "-5", "--oneline", ancestor])
-    parts.append(f"=== Recent Upstream Commits ===\n{upstream_log}\n")
-
-    return "\n".join(parts)
-
-
-def _gather_release_metadata(ancestor: str, excludes: typing.List[str]) -> str:
-    """Gather metadata for release notes, including all commit messages."""
-    parts: typing.List[str] = []
-    pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
-
-    stat, _ = run_git_command(
-        ["git", "diff", "--stat", f"{ancestor}..HEAD"] + pathspecs
+    upstream = _git("log", "-5", "--oneline", ancestor)
+    return Source(
+        context=brief + _sections(("Recent upstream commits", upstream)),
+        brief=brief,
+        files=files,
     )
-    parts.append(f"=== Files Changed ===\n{stat}\n")
-
-    log, _ = run_git_command(
-        ["git", "log", "--reverse", "--format=%h %s", f"{ancestor}..HEAD"]
-    )
-    if log:
-        parts.append(f"=== Commits ===\n{log}\n")
-
-    full_log, _ = run_git_command(
-        [
-            "git",
-            "log",
-            "--reverse",
-            "--format=--- %h %s ---%n%b",
-            f"{ancestor}..HEAD",
-        ]
-    )
-    if full_log:
-        parts.append(f"=== Full Commit Messages ===\n{full_log}\n")
-
-    return "\n".join(parts)
 
 
-def _get_diff(ancestor: str, excludes: typing.List[str], diff_context: int) -> str:
-    """Get the diff between ancestor and HEAD."""
-    pathspecs = ["--"] + [f":(exclude){e}" for e in excludes] if excludes else []
-    diff, _ = run_git_command(
-        [
-            "git",
-            "-c",
-            "diff.noprefix=false",
-            "diff",
-            "--patience",
-            f"-U{diff_context}",
-            f"{ancestor}..HEAD",
-        ]
-        + pathspecs
-    )
-    return diff
+def stdin_source(text: str, excludes: list[str]) -> Source:
+    """Collect the change from diff text, such as 'git show' output."""
+    preamble, files = parse_diff(text)
+    context = _sections(("Input header", preamble))
+    return Source(context=context, brief=context, files=_exclude(files, excludes))
 
 
-def _build_context(metadata: str, diff: str) -> str:
-    """Combine metadata and diff into full LLM context."""
-    if metadata:
-        return metadata + f"=== Changes ===\n{diff}"
-    return f"=== Changes ===\n{diff}"
+Ask = Callable[[str, str], str]
 
 
-def _split_diff(diff: str, max_chunk: int) -> typing.List[str]:
-    """Split a diff into chunks at file boundaries."""
-    # Parse into per-file diffs.
-    file_diffs: typing.List[str] = []
-    current: typing.List[str] = []
-    for line in diff.splitlines(True):
-        if line.startswith("diff --git ") and current:
-            file_diffs.append("".join(current))
-            current = [line]
-        else:
-            current.append(line)
-    if current:
-        file_diffs.append("".join(current))
-
-    # Group file diffs into chunks under max_chunk chars.
-    chunks: typing.List[str] = []
-    chunk: typing.List[str] = []
-    chunk_size = 0
-    for fd in file_diffs:
-        if chunk_size + len(fd) > max_chunk and chunk:
-            chunks.append("".join(chunk))
-            chunk = [fd]
-            chunk_size = len(fd)
-        else:
-            chunk.append(fd)
-            chunk_size += len(fd)
-    if chunk:
-        chunks.append("".join(chunk))
-    return chunks if chunks else [diff]
-
-
-def _call_ask(prompt: str, context: str, timeout: int = 30) -> typing.Optional[str]:
-    """Call the ask tool and return its output, or None on failure."""
+def _ask(prompt: str, data: str, timeout: int) -> str:
+    """Send data to the 'ask' tool with prompt and return its answer."""
     try:
         result = subprocess.run(
             ["ask", "-q", prompt],
-            input=context,
+            input=data,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return result.stdout.strip()
+    except subprocess.TimeoutExpired as e:
+        raise Error(f"ask timed out after {timeout}s") from e
+    answer = result.stdout.strip()
+    if result.returncode or not answer:
+        detail = result.stderr.strip() or "no output"
+        raise Error(f"ask failed with exit code {result.returncode}: {detail}")
+    return answer
 
 
-def _parallel_describe(metadata: str, diff: str, prompts: _Prompts) -> int:
-    """Split diff into chunks, describe each in parallel, then summarize."""
-    overhead = len(metadata) + 200
-    max_chunk = max(_MAX_CONTEXT - overhead, _MAX_CONTEXT // 2)
-    chunks = _split_diff(diff, max_chunk)
+def _ask_all(ask: Ask, prompt: str, inputs: list[str]) -> list[str]:
+    """Send the inputs in parallel and return the answers in input order."""
+    with concurrent.futures.ThreadPoolExecutor(_MAX_WORKERS) as pool:
+        futures = [pool.submit(ask, prompt, data) for data in inputs]
+        try:
+            return [future.result() for future in futures]
+        except Error:
+            pool.shutdown(cancel_futures=True)
+            raise
 
-    print(
-        f"Diff too large, splitting into {len(chunks)} chunks...",
-        file=sys.stderr,
+
+def _room(budget: int, overhead: str) -> int:
+    """Return the chars left for content after overhead."""
+    room = budget - len(overhead)
+    if room < 4 * _MAX_LINE:
+        raise Error(
+            f"Metadata leaves {room} of {budget} chars for content; raise --tokens"
+        )
+    return room
+
+
+def describe(source: Source, prompts: Prompts, budget: int, ask: Ask) -> str:
+    """Describe the change with requests of at most budget chars of input each."""
+    if not source.files:
+        raise Error("No changes to describe")
+    title = "Changes"
+    files = reduce_diff(source.files, _room(budget, source.context + _section(title, "")))
+    diff = "".join(f.render() for f in files)
+    if len(diff) <= _room(budget, source.context + _section(title, "")):
+        return ask(prompts.whole, source.context + _section(title, diff))
+
+    title = "Partial changes"
+    parts = split_diff(files, _room(budget, source.brief + _section(title, "")))
+    print(f"Diff is {len(diff)} chars; splitting into {len(parts)} parts", file=sys.stderr)
+    summaries = _ask_all(
+        ask, prompts.part, [source.brief + _section(title, part) for part in parts]
     )
 
-    descriptions: typing.List[typing.Tuple[int, str]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as pool:
-        futures = {}
-        for i, chunk in enumerate(chunks):
-            ctx = _build_context(metadata, f"(part {i + 1}/{len(chunks)})\n{chunk}")
-            futures[pool.submit(_call_ask, prompts.chunk, ctx, 60)] = i
-
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
-            try:
-                result = future.result()
-                if result:
-                    descriptions.append((idx, result))
-            except (OSError, subprocess.SubprocessError):
-                pass
-
-    if not descriptions:
-        print("Failed to generate descriptions for any chunk", file=sys.stderr)
-        return 1
-
-    descriptions.sort()
-    summaries = "\n\n".join(f"Part {idx + 1}:\n{desc}" for idx, desc in descriptions)
-    final = _call_ask(prompts.summary, summaries)
-    if not final:
-        print("Failed to generate final summary", file=sys.stderr)
-        return 1
-    print(final)
-    return 0
+    title = "Part summaries"
+    room = _room(budget, source.context + _section(title, ""))
+    while True:
+        items = [summary + "\n\n" for summary in summaries]
+        size = sum(map(len, items))
+        if size <= room:
+            break
+        groups = pack(items, room)
+        print(
+            f"Summaries are {size} chars, over {room}; merging into {len(groups)}",
+            file=sys.stderr,
+        )
+        merged = _ask_all(ask, _MERGE_PROMPT, ["".join(group) for group in groups])
+        if sum(map(len, merged)) >= sum(map(len, summaries)):
+            raise Error("Merging summaries did not shorten them; raise --tokens")
+        summaries = merged
+    return ask(prompts.final, source.context + _section(title, "".join(items)))
 
 
 def main() -> int:
     """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Generate a commit message or release notes using an LLM."
+    )
+    parser.add_argument(
+        "-b", "--base", help="base ref to diff against (default: upstream)"
+    )
+    parser.add_argument(
+        "-e",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help="path prefix to exclude from the diff (repeatable)",
+    )
+    parser.add_argument(
+        "-r",
+        "--release",
+        action="store_true",
+        help="generate release notes instead of a commit message",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokens",
+        type=int,
+        default=os.environ.get("GIT_DESC_TOKENS", "64000"),
+        help="model context window in tokens (default: $GIT_DESC_TOKENS or 64000)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="seconds to wait for each LLM request (default: 300)",
+    )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read the diff from stdin instead of computing it with git",
+    )
+    args = parser.parse_args()
+    if args.stdin and (args.base or args.release):
+        parser.error("--stdin excludes --base and --release")
+    if args.tokens < _MIN_TOKENS:
+        parser.error(f"--tokens must be at least {_MIN_TOKENS}")
+    if not shutil.which("ask"):
+        parser.error(
+            "'ask' not found in PATH; install it with: "
+            "go install github.com/maruel/ask@latest"
+        )
+
+    prompts = _RELEASE_PROMPTS if args.release else _COMMIT_PROMPTS
+    budget = int(args.tokens * (1 - _RESERVED_SHARE) * _CHARS_PER_TOKEN)
+    ask = functools.partial(_ask, timeout=args.timeout)
     try:
-        parser = argparse.ArgumentParser(
-            description="Generate a commit description using an LLM."
-        )
-        parser.add_argument(
-            "-b",
-            "--base",
-            help="base ref to diff against (default: upstream merge-base)",
-        )
-        parser.add_argument(
-            "-c",
-            "--context",
-            type=int,
-            default=10,
-            help="lines of diff context (default: 10)",
-        )
-        parser.add_argument(
-            "-e",
-            "--exclude",
-            action="append",
-            default=[],
-            help="path prefix to exclude from diff (can be repeated)",
-        )
-        parser.add_argument(
-            "-r",
-            "--release",
-            action="store_true",
-            help="generate release notes instead of a commit message",
-        )
-        parser.add_argument(
-            "--stdin",
-            action="store_true",
-            help="read diff from stdin instead of computing from git",
-        )
-        args = parser.parse_args()
-        if args.stdin and args.base:
-            parser.error("--stdin and --base are mutually exclusive")
-        if args.stdin and args.release:
-            parser.error("--stdin and --release are mutually exclusive")
-
-        if not shutil.which("ask"):
-            print("'ask' tool not found in PATH", file=sys.stderr)
-            print(
-                "Install it with: go install github.com/maruel/ask@latest",
-                file=sys.stderr,
-            )
-            return 1
-
         if args.stdin:
-            raw = sys.stdin.read()
-            if not raw.strip():
-                print("Empty input on stdin", file=sys.stderr)
-                return 1
-            diff = filter_diff(raw, args.exclude)
-            metadata = ""
+            source = stdin_source(sys.stdin.read(), args.exclude)
         else:
-            output, rc = run_git_command(
-                ["git", "rev-parse", "--show-toplevel"], check=False
-            )
-            if rc != 0:
-                print("Not in a git repository", file=sys.stderr)
-                return 1
-            os.chdir(output)
-            branch, rc = run_git_command(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False
-            )
-            if rc != 0 or branch == "HEAD":
-                print("Not on a branch (detached HEAD state)", file=sys.stderr)
-                return 1
-            ancestor = get_ancestor(args.base)
-            if not ancestor:
-                if args.base:
-                    return 1
-                print(
-                    f"No upstream branch configured for '{branch}'.\n"
-                    "Set an upstream with: "
-                    "git branch --set-upstream-to=<upstream>",
-                    file=sys.stderr,
-                )
-                return 1
-            commits_count, _ = run_git_command(
-                ["git", "rev-list", "--count", f"{ancestor}..HEAD"]
-            )
-            if commits_count == "0":
-                print("No commits to describe", file=sys.stderr)
-                return 1
-            if args.release:
-                metadata = _gather_release_metadata(ancestor, args.exclude)
-            else:
-                metadata = _gather_metadata(ancestor, args.exclude)
-            diff = _get_diff(ancestor, args.exclude, args.context)
-
-        # Step 1: reduce diff context lines to 3.
-        if len(_build_context(metadata, diff)) > _MAX_CONTEXT:
-            print(
-                "Diff too large, reducing context to 3 lines...",
-                file=sys.stderr,
-            )
-            diff = _reduce_diff_context(diff, 3)
-
-        # Step 2: drop test files from diff.
-        if len(_build_context(metadata, diff)) > _MAX_CONTEXT:
-            print("Diff too large, excluding test files...", file=sys.stderr)
-            diff = _filter_diff(diff, _is_test_file)
-
-        # Step 3: drop JSON/YAML files from diff.
-        if len(_build_context(metadata, diff)) > _MAX_CONTEXT:
-            print(
-                "Diff too large, excluding JSON/YAML files...",
-                file=sys.stderr,
-            )
-            diff = _filter_diff(diff, _is_data_file)
-
-        context = _build_context(metadata, diff)
-
-        prompts = _RELEASE_PROMPTS if args.release else _COMMIT_PROMPTS
-
-        # Step 4: split into chunks and parallelize.
-        if len(context) > _MAX_CONTEXT:
-            return _parallel_describe(metadata, diff, prompts)
-
-        result = subprocess.run(
-            ["ask", "-q", prompts.main],
-            input=context,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            print("Failed to generate output", file=sys.stderr)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
-            return 1
-        print(result.stdout.strip())
-        return 0
-    except subprocess.TimeoutExpired:
-        print("Timed out waiting for LLM response", file=sys.stderr)
-        return 1
+            source = git_source(args.base, args.release, args.exclude)
+        print(describe(source, prompts, budget, ask))
     except subprocess.CalledProcessError as e:
-        tb = traceback.extract_tb(e.__traceback__)
-        frame = None
-        for i, f in enumerate(tb):
-            if f.name == "run_git_command" and i > 0:
-                frame = tb[i - 1]
-                break
-        if frame:
-            print(f"Error in {frame.name}() at line {frame.lineno}:", file=sys.stderr)
-        print(f"Command failed: {' '.join(e.cmd)}", file=sys.stderr)
-        if e.stdout:
-            print(f"stdout: {e.stdout}", file=sys.stderr)
-        if e.stderr:
-            print(f"stderr: {e.stderr}", file=sys.stderr)
-        return e.returncode
+        print(f"{' '.join(e.cmd)}: {e.stderr.strip()}", file=sys.stderr)
+        return 1
+    except Error as e:
+        print(e, file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
