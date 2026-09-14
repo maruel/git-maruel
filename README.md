@@ -11,6 +11,10 @@ Two Python scripts that simplify common git workflows:
 | `git rb` | Rebases all local branches onto their upstreams in topological order, then removes empty branches (branches whose content is identical to their parent). Automatically handles conflicts with mergetool. |
 | `git mt` | git mergetool that auto-resolve binary files during rebase tree conflicts. ||
 
+`git desc` asks for a rationale body by default and permits its omission only
+for an obviously trivial, self-explanatory change. It asks the model to limit
+message lines to 120 characters.
+
 ## Usage
 
 Configures git to a "rebase linearized history flow" where "one PR/CL equals one commit".

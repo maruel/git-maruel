@@ -90,6 +90,27 @@ class TestParseDiff(unittest.TestCase):
         _, files = gd.parse_diff("diff --git a.go a.go\n@@ -1 +1 @@\n+x\n")
         self.assertEqual(files[0].path, "a.go")
 
+    def test_path_containing_diff_separator(self):
+        _, files = gd.parse_diff(_diff("lib b/name.go", "+x\n"))
+        self.assertEqual(files[0].path, "lib b/name.go")
+
+    def test_binary_path_containing_diff_separator(self):
+        _, files = gd.parse_diff(
+            "diff --git a/lib b/name.bin b/lib b/name.bin\n"
+            "Binary files a/lib b/name.bin and b/lib b/name.bin differ\n"
+        )
+        self.assertEqual(files[0].path, "lib b/name.bin")
+
+    def test_quoted_path(self):
+        text = (
+            'diff --git "a/caf\\303\\251.go" "b/caf\\303\\251.go"\n'
+            '--- "a/caf\\303\\251.go"\n'
+            '+++ "b/caf\\303\\251.go"\n'
+            "@@ -1 +1 @@\n+x\n"
+        )
+        _, files = gd.parse_diff(text)
+        self.assertEqual(files[0].path, "café.go")
+
     def test_malformed_hunk_header(self):
         with self.assertRaises(gd.Error):
             gd.parse_diff("diff --git a/a b/a\n@@ bogus\n")
@@ -275,6 +296,19 @@ class TestDescribe(unittest.TestCase):
         for _, data in ask.calls:
             self.assertLessEqual(len(data), _BUDGET)
 
+    def test_splits_one_oversized_summary_before_merging(self):
+        replies = {
+            "PART": "summary " * 4000,
+            gd._MERGE_PROMPT: "merged",
+            "FINAL": "final",
+        }
+        ask = _FakeAsk(lambda prompt, data: replies[prompt])
+        result = gd.describe(_source(_big_files()), _PROMPTS, _BUDGET, ask)
+        self.assertEqual(result, "final")
+        self.assertIn(gd._MERGE_PROMPT, ask.prompts())
+        for _, data in ask.calls:
+            self.assertLessEqual(len(data), _BUDGET)
+
     def test_merge_without_progress(self):
         ask = _FakeAsk(lambda prompt, data: "s" * 30_000)
         with self.assertRaises(gd.Error):
@@ -342,8 +376,15 @@ class TestGitSource(unittest.TestCase):
         self._git("commit", "-q", "-m", message)
 
     def test_commit(self):
+        self._git("config", "color.ui", "always")
+        self._git("config", "core.quotePath", "false")
+        self._git("config", "diff.mnemonicPrefix", "true")
+        self._git("config", "diff.noprefix", "true")
+        self._git("config", "diff.relative", "true")
         source = gd.git_source(None, False, ["vendor/"])
         self.assertEqual([f.path for f in source.files], ["a.go"])
+        self.assertTrue(source.files[0].render().startswith("diff --git a/a.go b/a.go"))
+        self.assertNotIn("\x1b", source.context)
         self.assertIn("=== Branch ===\nfeature\n", source.context)
         self.assertIn("Upstream subject", source.context)
         self.assertNotIn("Upstream subject", source.brief)
