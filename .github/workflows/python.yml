@@ -1,0 +1,16 @@
+name: Python
+
+on: [push, pull_request]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install pylint ruff
+      - run: pylint git-desc git-rb git-squash
+      - run: ruff check --no-cache git-desc git-rb git-squash tests
+      - run: python -m unittest discover -s tests

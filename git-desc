@@ -164,7 +164,7 @@ class Hunk:
                 drop = range(start + n, i - n)
             for k in drop:
                 keep[k] = False
-        lines = tuple(line for line, k in zip(self.lines, keep) if k)
+        lines = tuple(line for line, k in zip(self.lines, keep, strict=True) if k)
         return Hunk(self.old_start + lead, self.new_start + lead, self.section, lines)
 
     def split(self, limit: int) -> list["Hunk"]:

@@ -176,7 +176,7 @@ class TestHunkSplit(unittest.TestCase):
         self.assertGreater(len(hunks), 1)
         for hunk in hunks:
             self.assertLessEqual(len(hunk.render()), 200)
-        self.assertEqual(tuple(l for h in hunks for l in h.lines), lines)
+        self.assertEqual(tuple(line for hunk in hunks for line in hunk.lines), lines)
         self.assertEqual(hunks[1].old_start, 1)
         self.assertEqual(hunks[1].new_start, 1 + len(hunks[0].lines))
 

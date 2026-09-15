@@ -6,21 +6,17 @@ import os
 import subprocess
 import sys
 import traceback
-import typing
-
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def run_git_command(
-    cmd: typing.List[str], check: bool = True
-) -> typing.Tuple[str, int]:
+def run_git_command(cmd: list[str], check: bool = True) -> tuple[str, int]:
     """Run a git command and return output and return code."""
     result = subprocess.run(cmd, capture_output=True, text=True, check=check)
     return result.stdout.strip(), result.returncode
 
 
-def get_ancestor() -> typing.Optional[str]:
+def get_ancestor() -> str | None:
     """Get the ancestor (merge-base) between HEAD and its upstream."""
     _, rc = run_git_command(["git", "rev-parse", "--abbrev-ref", "@{u}"], check=False)
     if rc != 0:
