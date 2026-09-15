@@ -12,8 +12,8 @@ Two Python scripts that simplify common git workflows:
 | `git mt` | git mergetool that auto-resolve binary files during rebase tree conflicts. ||
 
 `git desc` asks for a rationale body by default and permits its omission only
-for an obviously trivial, self-explanatory change. It asks the model to limit
-message lines to 120 characters.
+for an obviously trivial, self-explanatory change. It asks the model to wrap
+body lines at 80 columns.
 
 ## Usage
 

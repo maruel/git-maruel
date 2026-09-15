@@ -12,3 +12,6 @@ jobs:
           python-version: '3.11'
       - run: pip install pylint
       - run: pylint git-desc git-rb git-squash
+      - run: |
+          tests/git-desc_test.py
+          tests/git-squash_test.py

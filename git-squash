@@ -119,7 +119,9 @@ def main() -> int:
         run_git_command(["git", "reset", "--soft", ancestor])
         result = subprocess.run(["git", "commit", "-m", new_log], check=False)
         if result.returncode != 0:
-            run_git_command(["git", "reset", "--hard", original_head])
+            # Undo only the HEAD move. The failed commit or its hooks may have
+            # changed the index or working tree, so preserve both.
+            run_git_command(["git", "reset", "--soft", original_head])
             return result.returncode
         if args.desc:
             return generate_desc()

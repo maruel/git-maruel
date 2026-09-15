@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 # Import git-desc as a module despite the hyphen and missing .py extension.
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _loader = importlib.machinery.SourceFileLoader(
     "git_desc", os.path.join(_HERE, "git-desc")
 )
@@ -260,7 +260,10 @@ def _source(files, context="=== Branch ===\nfeature\n\n"):
 
 
 def _big_files(count=10):
-    return [_file(f"f{i}.go", [f"+{i} line{j:03}\n" for j in range(400)]) for i in range(count)]
+    return [
+        _file(f"f{i}.go", [f"+{i} line{j:03}\n" for j in range(400)])
+        for i in range(count)
+    ]
 
 
 class TestDescribe(unittest.TestCase):
