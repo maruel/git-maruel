@@ -15,6 +15,8 @@ Two Python scripts that simplify common git workflows:
 for an obviously trivial, self-explanatory change. It asks the model to wrap
 body lines at 80 columns.
 
+![git rb rebasing a branch, deleting a merged branch, and reporting a conflict](rsc/git-rb.gif)
+
 ## Usage
 
 Configures git to a "rebase linearized history flow" where "one PR/CL equals one commit".
