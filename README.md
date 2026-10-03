@@ -8,7 +8,7 @@ Two Python scripts that simplify common git workflows:
 | ------- | ----------- |
 | `git desc` | Generates a commit description using an LLM. Gathers the diff between the current branch and its upstream, then uses [`ask`](https://github.com/maruel/ask) to produce a commit message, or release notes with `-r`. Designed for use after `git squash`. Set the model context window with `-t` or `GIT_DESC_TOKENS` (default 64000); larger diffs are split into parts summarized in parallel. |
 | `git squash` | Squashes all commits on the current branch into a single commit. Combines all commits since the upstream branch into one, merging their commit messages. Requires an upstream branch to be configured. |
-| `git rb` | Rebases all local branches onto their upstreams in topological order, then removes empty branches (branches whose content is identical to their parent). Automatically handles conflicts with mergetool. |
+| `git rb` | Rebases all local branches onto their upstreams in topological order, then removes empty branches (branches whose content is identical to their parent). Aborts failed rebases and continues with the remaining branches. Preserves failed branches, checks out the first failure after cleanup, and exits nonzero. If all rebases succeed, returns to the original branch unless it was deleted. |
 | `git mt` | git mergetool that auto-resolve binary files during rebase tree conflicts. ||
 
 `git desc` asks for a rationale body by default and permits its omission only

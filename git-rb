@@ -62,11 +62,16 @@ def topo_iter(tree: typing.Dict[str, str]) -> typing.List[typing.Tuple[str, str]
     return result
 
 
-def format_branch_name(name: str) -> str:
-    """Format branch name with bold ANSI escape codes (disabled on Windows)."""
+def format_ansi(text: str, code: int) -> str:
+    """Apply ANSI styling except on Windows."""
     if platform.system() == "Windows":
-        return name
-    return f"\033[1m{name}\033[0m"
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def format_branch_name(name: str) -> str:
+    """Format branch name in bold."""
+    return format_ansi(name, 1)
 
 
 def get_tree(ref: str) -> str:
@@ -74,8 +79,10 @@ def get_tree(ref: str) -> str:
     return run_git_command(["git", "rev-parse", f"{ref}^{{tree}}"])[0]
 
 
-def rebase_branch(branch: str, parent: str, start_hash: str) -> bool:
-    """Rebase a branch onto its parent."""
+def rebase_branch(
+    branch: str, parent: str, start_hash: str
+) -> typing.Literal["conflicted", "rebase failed"] | None:
+    """Rebase a branch onto its parent. Return the failure status, if any."""
     # Check if already up-to-date
     parent_hash, parent_rc = run_git_command(["git", "rev-parse", parent], check=False)
     if parent_rc == 0:
@@ -84,29 +91,36 @@ def rebase_branch(branch: str, parent: str, start_hash: str) -> bool:
         )
         if start_rc == 0 and parent_hash == start_output:
             print(f"- {format_branch_name(branch)}: up-to-date")
-            return True
+            return None
     print(f"- {format_branch_name(branch)}: rebasing")
     run_git_command(["git", "switch", branch])
-    if run_git_command(["git", "rebase", parent], check=False)[1] == 0:
-        return True
-    # Rebase failed - try to resolve with mergetool
-    print("  Conflicts detected. Starting mergetool...")
-    while True:
-        ret = subprocess.run(["git", "mergetool"], check=False)
-        if ret.returncode:
-            return False
-        if not subprocess.run(["git", "rebase", "--continue"], check=False).returncode:
-            return True
+    result = subprocess.run(["git", "rebase", parent], capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return None
+    conflicted = bool(run_git_command(["git", "ls-files", "--unmerged"])[0])
+    # Abort before switching branches. Only expected conflicts stay quiet.
+    # Report other failures. Stop if abort fails.
+    abort = subprocess.run(
+        ["git", "rebase", "--abort"], capture_output=True, text=True, check=False
+    )
+    if not conflicted or abort.returncode:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+    abort.check_returncode()
+    return "conflicted" if conflicted else "rebase failed"
 
 
 def remove_empty_branches(
     sorted_branches: typing.List[typing.Tuple[str, str]],
+    failed_branches: typing.Set[str],
 ) -> typing.Set[str]:
     """Remove empty branches in reverse topological order. Returns set of deleted branches."""
     deleted = set()
     # Reverse to process children before parents
     for branch, parent in reversed(sorted_branches):
-        if branch not in ("main", "master"):
+        if branch not in ("main", "master") and branch not in failed_branches:
             branch_tree = get_tree(branch)
             if bool(branch_tree) and branch_tree == get_tree(parent):
                 # Reparent any branches that depend on this branch
@@ -191,22 +205,22 @@ def main() -> int:
                 else run_git_command(["git", "rev-parse", parent])[0]
             )
         sorted_branches = topo_iter(branch_tree)
-        unrebased_branches = []
+        failures = []
         for branch, parent in sorted_branches:
-            if not rebase_branch(branch, parent, merge_bases[branch]):
+            status = rebase_branch(branch, parent, merge_bases[branch])
+            if status is not None:
                 retcode = 1
-                unrebased_branches.append(branch)
-        if unrebased_branches:
-            print()
-            print("The following branches could not be cleanly rebased:")
-            for branch in unrebased_branches:
-                print(f"  {format_branch_name(branch)}")
-        deleted_branches = set()
-        if retcode == 0:
-            deleted_branches = remove_empty_branches(sorted_branches)
-            run_git_command(["git", "gc", "--auto"])
-        # Restore the original branch/commit
-        if original_ref not in deleted_branches:
+                failures.append((branch, status))
+        deleted_branches = remove_empty_branches(
+            sorted_branches, {branch for branch, _ in failures}
+        )
+        run_git_command(["git", "gc", "--auto"])
+        for branch, status in failures:
+            print(f"- {format_branch_name(branch)}: {format_ansi(status, 31)}")
+        # Return to the first failure for manual resolution, or the original branch.
+        if failures:
+            run_git_command(["git", "switch", failures[0][0]])
+        elif original_ref not in deleted_branches:
             run_git_command(["git", "checkout", original_ref], check=False)
         else:
             # Original branch was deleted, fall back to safe branches
